@@ -92,6 +92,14 @@
             return stateApi.updateState(patch || {});
         }
 
+        function updateStateWith(mutator) {
+            if (stateApi && typeof stateApi.updateStateWith === "function") {
+                _log("debug", "state.update.atomic", null);
+                return stateApi.updateStateWith(mutator);
+            }
+            return updateState(typeof mutator === "function" ? mutator(getState()) : {});
+        }
+
         function loadState() {
             if (!stateApi || typeof stateApi.loadState !== "function") {
                 return getState();
@@ -145,6 +153,7 @@
         return {
             getState: getState,
             updateState: updateState,
+            updateStateWith: updateStateWith,
             loadState: loadState,
             saveState: saveState,
             getStateFilePath: getStateFilePath,

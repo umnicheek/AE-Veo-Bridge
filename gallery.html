@@ -148,9 +148,10 @@
                         <button id="btnGenerate" type="button" class="flow-go-btn" aria-label="Generate" title="Generate">
                             <svg class="ui-icon flow-go-icon" aria-hidden="true"><use href="#vb-icon-arrow-right" xlink:href="#vb-icon-arrow-right"></use></svg>
                         </button>
+                        <button id="btnCancelVideo" type="button" title="Pause active video polling" hidden>Pause</button>
                     </div>
-                    <p id="generationStatus" class="inline-status ghost-hidden" hidden>Idle.</p>
-                    <p id="imageGenerationStatus" class="inline-status ghost-hidden" hidden>Idle.</p>
+                    <p id="generationStatus" class="inline-status ghost-hidden" hidden>Ready.</p>
+                    <p id="imageGenerationStatus" class="inline-status ghost-hidden" hidden>Ready.</p>
 
                     <div id="videoFlowOptions" class="flow-options-popover" hidden>
                         <div class="flow-options-grid two">
@@ -175,12 +176,12 @@
                             </button>
                         </div>
 
-                        <div id="videoOptionsRow" class="flow-options-grid five">
+                        <div id="videoOptionsRow" class="flow-options-grid six">
                             <label class="flow-opt">
                                 <span>Samples</span>
                                 <select id="sampleCountSelect">
-                                    <option value="1">x1</option>
-                                    <option value="2" selected>x2</option>
+                                    <option value="1" selected>x1</option>
+                                    <option value="2">x2</option>
                                     <option value="3">x3</option>
                                     <option value="4">x4</option>
                                 </select>
@@ -213,7 +214,12 @@
                                 <select id="resolutionSelect">
                                     <option value="720p" selected>720p</option>
                                     <option value="1080p">1080p</option>
+                                    <option value="4k">4K</option>
                                 </select>
+                            </label>
+                            <label class="flow-opt">
+                                <span>Seed (optional)</span>
+                                <input id="seedInput" type="number" step="1" placeholder="Random" title="Optional integer seed for slightly more repeatable results">
                             </label>
                         </div>
 
@@ -238,8 +244,7 @@
                             <label class="flow-opt">
                                 <span>Model</span>
                                 <select id="imageModelSelect">
-                                    <option value="gemini-3.1-flash-image-preview">Nano Banana 2</option>
-                                    <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
+                                    <option value="gemini-3.1-flash-image">Nano Banana 2</option>
                                 </select>
                             </label>
                             <label class="flow-opt">
@@ -297,6 +302,7 @@
                             <button id="btnMediaPreviewCapture" type="button" title="Capture current frame">Capture</button>
                             <button id="btnMediaPreviewToFrames" type="button" title="Add this image to Captured Frames">To Frames</button>
                             <button id="btnMediaPreviewReveal" type="button" title="Reveal file in Finder or Explorer">Reveal</button>
+                            <button id="btnMediaPreviewExtend" type="button" title="Extend this Veo 3.1 video">Extend</button>
                             <button id="btnMediaPreviewDelete" type="button" class="is-danger" title="Delete from VeoBridge library">Delete</button>
                             <button id="btnCloseMediaPreview" type="button" title="Close media preview">Close</button>
                         </div>
@@ -312,9 +318,9 @@
 
             <div id="cleanupConfirmModal" class="modal-backdrop" hidden>
                 <div class="modal-card">
-                    <h2 class="modal-title">Cleanup VeoBridge Files?</h2>
-                    <p class="muted-note">
-                        This will remove orphan files from VeoBridge storage and clear VeoBridge trash.
+                    <h2 id="cleanupConfirmTitle" class="modal-title">Cleanup VeoBridge Files?</h2>
+                    <p id="cleanupConfirmText" class="muted-note">
+                        This removes failed/interrupted job cards, orphan files, missing library entries, and VeoBridge trash. Generated files referenced by the library are kept.
                     </p>
                     <div class="modal-actions">
                         <button id="btnCleanupCancel" type="button">Cancel</button>
@@ -386,9 +392,27 @@
 
     <div id="hoverTooltip" class="hover-tooltip" hidden></div>
 
+    <div id="extendModal" class="modal-backdrop" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="extendTitle">
+            <h2 id="extendTitle" class="modal-title">Extend Veo video</h2>
+            <div id="extendSourceLabel" class="field-label"></div>
+            <label for="extendPromptInput" class="field-label">How should the scene continue?</label>
+            <textarea id="extendPromptInput" rows="4" placeholder="Continue the scene naturally"></textarea>
+            <label for="extendSeedInput" class="field-label">Seed (optional)</label>
+            <input id="extendSeedInput" type="number" step="1" placeholder="Random">
+            <p class="status-line">Veo 3.1 / Fast · 8s · 720p</p>
+            <div class="modal-actions">
+                <button id="btnCancelExtend" type="button">Cancel</button>
+                <button id="btnConfirmExtend" type="button" class="btn-primary">Extend</button>
+            </div>
+        </div>
+    </div>
+
     <script src="./js/csinterface-lite.js"></script>
     <script src="./js/sharedState.js"></script>
+    <script src="./js/secureStore.js"></script>
     <script src="./js/settingsStore.js"></script>
+    <script src="./js/modelPolicy.js"></script>
     <script src="./js/veoApi.js"></script>
     <script src="./js/gallery/state-adapter.js"></script>
     <script src="./js/gallery/queue.js"></script>

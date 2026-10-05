@@ -36,6 +36,7 @@
         </section>
 
         <p id="statusLine" class="status-line">Ready.</p>
+        <button id="btnCopyDiagnostic" type="button" hidden>Copy error details</button>
     </main>
 
     <div id="settingsModal" class="modal-backdrop" hidden>
@@ -44,6 +45,8 @@
             <label for="apiKeyInput" class="field-label">API key</label>
             <input id="apiKeyInput" type="password" placeholder="Enter Gemini API key">
             <div class="modal-actions">
+                <button id="btnHostPing" type="button">Test host</button>
+                <button id="btnCaptureProbe" type="button">Test Capture</button>
                 <button id="btnCloseSettings" type="button">Close</button>
                 <button id="btnSaveApiKey" type="button" class="btn-primary">Save</button>
             </div>
@@ -116,6 +119,7 @@
 
     <script src="./js/csinterface-lite.js"></script>
     <script src="./js/sharedState.js"></script>
+    <script src="./js/secureStore.js"></script>
     <script src="./js/settingsStore.js"></script>
     <script src="./js/main.js"></script>
 </body>

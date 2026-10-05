@@ -7,14 +7,26 @@
 
     function _escapeJsonString(value) {
         var str = String(value);
-        return str
-            .replace(/\\/g, "\\\\")
-            .replace(/"/g, "\\\"")
-            .replace(/\r/g, "\\r")
-            .replace(/\n/g, "\\n")
-            .replace(/\t/g, "\\t")
-            .replace(/\f/g, "\\f")
-            .replace(/\x08/g, "\\b");
+        var out = "";
+        var i;
+        var code;
+        var hex;
+        for (i = 0; i < str.length; i += 1) {
+            code = str.charCodeAt(i);
+            if (code === 34) { out += "\\\""; }
+            else if (code === 92) { out += "\\\\"; }
+            else if (code === 8) { out += "\\b"; }
+            else if (code === 9) { out += "\\t"; }
+            else if (code === 10) { out += "\\n"; }
+            else if (code === 12) { out += "\\f"; }
+            else if (code === 13) { out += "\\r"; }
+            else if (code < 32 || code > 126) {
+                hex = code.toString(16);
+                while (hex.length < 4) { hex = "0" + hex; }
+                out += "\\u" + hex;
+            } else { out += str.charAt(i); }
+        }
+        return out;
     }
 
     function _jsonStringify(value) {
@@ -24,14 +36,6 @@
 
         if (value === null) {
             return "null";
-        }
-
-        if (typeof JSON !== "undefined" && JSON && JSON.stringify) {
-            try {
-                return JSON.stringify(value);
-            } catch (jsonError) {
-                // Fall through to manual serializer.
-            }
         }
 
         if (typeof value === "string") {
@@ -153,7 +157,7 @@
             pad2(d.getDate()) + "_" +
             pad2(d.getHours()) +
             pad2(d.getMinutes()) +
-            pad2(d.getSeconds());
+            pad2(d.getSeconds()) + "_" + String(d.getMilliseconds());
     }
 
     function _getActiveComp() {
@@ -445,13 +449,15 @@
         var maxWait = typeof timeoutMs === "number" ? timeoutMs : 800;
 
         while (waited < maxWait) {
-            if (fileObj.exists) {
-                return true;
+            fileObj = new File(fileObj.fsName);
+            if (fileObj.exists && fileObj.length > 0) {
+                return fileObj;
             }
             _sleepMs(step);
             waited += step;
         }
-        return fileObj.exists;
+        fileObj = new File(fileObj.fsName);
+        return fileObj.exists && fileObj.length > 0 ? fileObj : null;
     }
 
     function _listPngFiles(folderPath) {
@@ -511,8 +517,9 @@
         } catch (e1) {
             errors.push("fsName: " + String(e1));
         }
-        if (_waitForFile(targetFile, 900)) {
-            return { file: targetFile, details: errors.join(" | ") };
+        discovered = _waitForFile(targetFile, 1500);
+        if (discovered) {
+            return { file: discovered, details: errors.join(" | ") };
         }
 
         afterFiles = _listPngFiles(targetFile.parent.fsName);
@@ -527,8 +534,9 @@
         } catch (e2) {
             errors.push("absoluteURI: " + String(e2));
         }
-        if (_waitForFile(targetFile, 900)) {
-            return { file: targetFile, details: errors.join(" | ") };
+        discovered = _waitForFile(targetFile, 1500);
+        if (discovered) {
+            return { file: discovered, details: errors.join(" | ") };
         }
 
         afterFiles = _listPngFiles(targetFile.parent.fsName);
@@ -543,8 +551,9 @@
         } catch (e3) {
             errors.push("fileObject: " + String(e3));
         }
-        if (_waitForFile(targetFile, 900)) {
-            return { file: targetFile, details: errors.join(" | ") };
+        discovered = _waitForFile(targetFile, 1500);
+        if (discovered) {
+            return { file: discovered, details: errors.join(" | ") };
         }
 
         afterFiles = _listPngFiles(targetFile.parent.fsName);
@@ -598,12 +607,12 @@
         var frameIndex;
 
         if (!comp) {
-            return _makeError("NO_ACTIVE_COMP", "Active composition is required.");
+            return _makeError("NO_ACTIVE_COMP", "Active composition is required.", { stage: "active_composition" });
         }
 
         paths = _resolveDiskPaths();
         if (!paths) {
-            return _makeError("PATH_INIT_FAILED", "Unable to prepare VeoBridge folders on disk.");
+            return _makeError("PATH_INIT_FAILED", "Unable to prepare VeoBridge folders on disk.", { stage: "prepare_folder" });
         }
 
         frameIndex = Math.round(comp.time * comp.frameRate);
@@ -628,6 +637,7 @@
 
             if (!fallbackFramesFolder) {
                 return _makeError("CAPTURE_FAILED", "Failed to capture frame.", {
+                    stage: "primary_capture",
                     details: firstErrorDetails
                 });
             }
@@ -641,6 +651,7 @@
             } else {
                 secondErrorDetails = captureAttempt.details;
                 return _makeError("CAPTURE_FAILED", "Failed to capture frame.", {
+                    stage: "fallback_capture",
                     details: "Primary: " + firstErrorDetails + " | Fallback: " + secondErrorDetails
                 });
             }
@@ -648,6 +659,7 @@
 
         if (!outputFile.exists) {
             return _makeError("CAPTURE_NOT_FOUND", "Frame capture command completed, but output file was not found.", {
+                stage: "verify_output",
                 path: outputFile.fsName,
                 details: captureAttempt && captureAttempt.details ? captureAttempt.details : "Output file missing after capture."
             });
@@ -1124,4 +1136,82 @@
             ratioLabel: normalizedRatio
         });
     };
+
+    $.global.VeoBridge_ping = function () {
+        return _makeResult(true, {
+            command: "ping",
+            appName: app && app.name ? app.name : "After Effects",
+            appVersion: app && app.version ? app.version : "unknown"
+        });
+    };
+
+    $.global.VeoBridge_captureProbe = function () {
+        var comp = _getActiveComp();
+        var paths = _resolveDiskPaths();
+        var probeFile;
+        var writable = false;
+        if (paths && paths.framesDir) {
+            probeFile = new File(_joinPath(paths.framesDir, ".veobridge-write-probe-" + _timestamp() + ".tmp"));
+            try {
+                if (probeFile.open("w")) {
+                    probeFile.write("ok");
+                    probeFile.close();
+                    writable = probeFile.exists && probeFile.length > 0;
+                    if (probeFile.exists) { probeFile.remove(); }
+                }
+            } catch (probeError) {
+                try { if (probeFile.opened) { probeFile.close(); } } catch (closeError) {}
+                return _makeError("CAPTURE_PROBE_FAILED", "Capture folder is not writable.", {
+                    stage: "write_probe",
+                    path: probeFile ? probeFile.fsName : "",
+                    details: String(probeError)
+                });
+            }
+        }
+        if (!paths || !writable) {
+            return _makeError("CAPTURE_PROBE_FAILED", "Unable to verify capture folder.", {
+                stage: "write_probe",
+                path: paths ? paths.framesDir : ""
+            });
+        }
+        return _makeResult(true, {
+            command: "captureProbe",
+            stage: "ready",
+            path: paths.framesDir,
+            writable: true,
+            hasActiveComp: !!comp,
+            compName: comp ? comp.name : ""
+        });
+    };
+
+    function _installSafeHostWrappers() {
+        var names = [
+            "VeoBridge_getPaths", "VeoBridge_captureCurrentFrame", "VeoBridge_importVideo",
+            "VeoBridge_importImage", "VeoBridge_importVideoToActiveComp",
+            "VeoBridge_importImageToActiveComp", "VeoBridge_createCompWithBackground",
+            "VeoBridge_ping", "VeoBridge_captureProbe"
+        ];
+        var i;
+        for (i = 0; i < names.length; i += 1) {
+            (function (name, original) {
+                if (typeof original !== "function") { return; }
+                $.global[name] = function () {
+                    try {
+                        var result = original.apply($.global, arguments);
+                        if (typeof result === "string") { return result; }
+                        return _makeResult(true, { value: result });
+                    } catch (error) {
+                        return _makeError("HOST_EXCEPTION", "Host command failed.", {
+                            stage: name,
+                            details: String(error),
+                            line: error && error.line ? error.line : null,
+                            fileName: error && error.fileName ? error.fileName : null
+                        });
+                    }
+                };
+            }(names[i], $.global[names[i]]));
+        }
+    }
+
+    _installSafeHostWrappers();
 }());

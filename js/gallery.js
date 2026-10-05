@@ -19,6 +19,7 @@
     var MODEL_VEO_31 = "veo-3.1-generate-preview";
     var MODEL_VEO_31_FAST = "veo-3.1-fast-generate-preview";
     var MODEL_VEO_31_LITE = "veo-3.1-lite-generate-preview";
+    var RUNTIME_BUILD_ID = "0.4.1+schema8";
 
     var path = null;
     var fs = null;
@@ -27,7 +28,10 @@
     var cs = null;
 
     var isVideoGenerating = false;
+    var isVideoSubmitStarting = false;
+    var cancelVideoRunRequested = false;
     var isImageGenerating = false;
+    var isImageSubmitStarting = false;
     var isResumingPendingJobs = false;
     var videoCapabilities = {
         checked: false,
@@ -45,6 +49,7 @@
     var windowSizeSaveTimer = null;
     var windowSizePollTimer = null;
     var pendingVideoResumeTimer = null;
+    var pendingVideoResumeAllowQueued = false;
     var pendingJobsLeaseHeartbeatTimer = null;
     var pendingJobsStaleTimer = null;
     var pendingVideoInjectedJobIds = [];
@@ -53,12 +58,22 @@
     var lastKnownWindowWidth = 0;
     var lastKnownWindowHeight = 0;
     var pendingJobsRunnerId = "runner_" + String(new Date().getTime()) + "_" + String(Math.floor(Math.random() * 1000000));
+    var pendingJobsRunId = null;
+    var pendingJobsCurrentJobId = null;
+    var pendingJobsLastProgressAtMs = 0;
     var lastVideosListRenderKey = null;
     var lastImagesListRenderKey = null;
+    var lastShotsRenderKey = null;
+    var lastRefsRenderKey = null;
+    var lastVideoPreviewRenderKey = null;
+    var lastImagePreviewRenderKey = null;
+    var lastMediaOverlayRenderKey = null;
+    var lastSettingsRenderKey = null;
     var activeGenerationType = GEN_TYPE_VIDEO;
     var shotPickerContext = null;
     var mediaPreviewKind = "";
     var mediaPreviewId = "";
+    var pendingExtendVideoId = "";
     var isCapturingPreviewFrame = false;
     var isVideoFlowOptionsOpen = false;
     var isImageFlowOptionsOpen = false;
@@ -80,15 +95,15 @@
         downloading: true,
         importing: true
     };
-    var PENDING_JOBS_LEASE_TTL_MS = 9000;
-    var PENDING_JOBS_LEASE_HEARTBEAT_MS = 2500;
-    var CARD_HIGH_LOAD_MESSAGE = "Generation was interrupted due to high load.";
+    var PENDING_JOBS_LEASE_TTL_MS = 15000;
+    var PENDING_JOBS_LEASE_HEARTBEAT_MS = 5000;
     var CARD_INTERRUPTED_MESSAGE = "Generation was interrupted because the app was closed before completion.";
     var PENDING_IMAGE_JOB_STALE_MS = 25000;
     var PENDING_VIDEO_JOB_STALE_ACTIVE_MS = 180000;
     var PENDING_VIDEO_JOB_STALE_POLLING_MS = 1200000;
     var PENDING_VIDEO_JOB_STALE_POLLING_WITH_OPERATION_MS = 2700000;
     var PENDING_JOBS_STALE_SCAN_MS = 5000;
+    var PENDING_JOBS_PROGRESS_WATCHDOG_MS = 180000;
     var smoothProgressByJobId = {};
     var smoothProgressTimer = null;
     var SMOOTH_PROGRESS_SLOWDOWN_MULTIPLIER = 4;
@@ -102,6 +117,11 @@
     var actionsAdapter = null;
     var hoverTooltipEl = null;
     var hoverTooltipTarget = null;
+    var fileExistsCache = {};
+    var FILE_EXISTS_CACHE_MS = 1500;
+    var galleryGroupRenderLimit = 40;
+    var galleryLoadMoreObserver = null;
+    var GALLERY_GROUP_RENDER_STEP = 30;
 
     function getSvgIconMarkup(iconId, extraClass) {
         var className = "ui-icon";
@@ -284,6 +304,7 @@
                     getHostPaths: function () {
                         return hostPaths;
                     },
+                    runtimeBuildId: RUNTIME_BUILD_ID,
                     revealPathInExplorer: revealPathInExplorer
                 });
             } catch (createError) {
@@ -523,6 +544,8 @@
     function acknowledgePendingGalleryOpen() {
         var runtime = readRuntimeState();
         var pendingOpenNonce = runtime && runtime.pendingOpenNonce ? String(runtime.pendingOpenNonce) : "";
+        var bridge;
+        var event;
 
         if (!pendingOpenNonce) {
             return;
@@ -531,7 +554,35 @@
             galleryReadyNonce: pendingOpenNonce,
             galleryLastSeenAt: new Date().getTime()
         });
+        try {
+            if (typeof window.focus === "function") {
+                window.focus();
+            }
+        } catch (focusError) {}
+        bridge = ensureCs();
+        if (bridge && typeof bridge.dispatchEvent === "function" && typeof window.CSEvent === "function") {
+            event = new window.CSEvent("com.veobridge.gallery.ready", "APPLICATION");
+            event.data = JSON.stringify({ nonce: pendingOpenNonce });
+            bridge.dispatchEvent(event);
+        }
     }
+
+    function onGalleryOpenRequest() {
+        acknowledgePendingGalleryOpen();
+    }
+
+    function bindGalleryOpenBridge() {
+        var bridge = ensureCs();
+        if (bridge && typeof bridge.addEventListener === "function") {
+            bridge.addEventListener("com.veobridge.gallery.open.request", onGalleryOpenRequest);
+        }
+    }
+
+    // Acknowledge as soon as the script has loaded. Waiting for the complete
+    // Gallery initialization makes the small launcher susceptible to CEP timer
+    // suspension when the modeless window takes focus.
+    bindGalleryOpenBridge();
+    acknowledgePendingGalleryOpen();
 
     function parseHostResult(raw) {
         if (typeof raw !== "string") {
@@ -671,15 +722,25 @@
     }
 
     function fileExists(filePath) {
+        var cacheKey;
+        var cached;
+        var now;
         if (!filePath) {
             return false;
         }
         if (!fs || typeof fs.existsSync !== "function") {
             return true;
         }
+        cacheKey = normalizePathForCompare(filePath);
+        now = new Date().getTime();
+        cached = fileExistsCache[cacheKey];
+        if (cached && now - cached.checkedAt < FILE_EXISTS_CACHE_MS) { return cached.exists; }
         try {
-            return !!fs.existsSync(filePath);
+            cached = { exists: !!fs.existsSync(filePath), checkedAt: now };
+            fileExistsCache[cacheKey] = cached;
+            return cached.exists;
         } catch (error) {
+            fileExistsCache[cacheKey] = { exists: false, checkedAt: now };
             return false;
         }
     }
@@ -739,11 +800,17 @@
     }
 
     function resolveLibraryVideosDir() {
-        var targetDir = path.join(resolveUserDataBridgeDir(), "videos");
+        var bridgeDir;
+        var targetDir;
 
-        if (!path || !targetDir) {
+        if (!path) {
             return "";
         }
+        bridgeDir = resolveUserDataBridgeDir();
+        if (!bridgeDir) {
+            return "";
+        }
+        targetDir = path.join(bridgeDir, "videos");
         if (!ensureDirRecursive(targetDir)) {
             return "";
         }
@@ -752,11 +819,17 @@
     }
 
     function resolveLibraryImagesDir() {
-        var targetDir = path.join(resolveUserDataBridgeDir(), "images");
+        var bridgeDir;
+        var targetDir;
 
-        if (!path || !targetDir) {
+        if (!path) {
             return "";
         }
+        bridgeDir = resolveUserDataBridgeDir();
+        if (!bridgeDir) {
+            return "";
+        }
+        targetDir = path.join(bridgeDir, "images");
         if (!ensureDirRecursive(targetDir)) {
             return "";
         }
@@ -1482,14 +1555,27 @@
 
     function openCleanupConfirmModal() {
         var modal = getById("cleanupConfirmModal");
+        var title = getById("cleanupConfirmTitle");
+        var text = getById("cleanupConfirmText");
+        var cancelButton = getById("btnCleanupCancel");
+        var confirmButton = getById("btnCleanupConfirm");
+        var activeLease = getPendingJobsLease(getState());
         if (isVideoGenerating || isImageGenerating || isResumingPendingJobs) {
             setStatus("Cleanup is blocked while generation is running.", true);
+            return;
+        }
+        if (isPendingJobsLeaseActive(activeLease)) {
+            setStatus("Cleanup is blocked while another Gallery owns the generation queue.", true);
             return;
         }
         if (!modal) {
             runCleanup();
             return;
         }
+        if (title) { title.textContent = "Cleanup VeoBridge Files?"; }
+        if (text) { text.textContent = "This removes failed/interrupted job cards, orphan files, missing library entries, and VeoBridge trash. Generated files referenced by the library are kept."; }
+        if (cancelButton) { cancelButton.textContent = "Cancel"; }
+        if (confirmButton) { confirmButton.hidden = false; confirmButton.disabled = false; }
         modal.hidden = false;
     }
 
@@ -1503,6 +1589,7 @@
 
     function runCleanup() {
         var state = getState();
+        var activeLease = getPendingJobsLease(state);
         var pruneResult;
         var cleanState;
         var orphanResult;
@@ -1510,16 +1597,38 @@
         var pruneStats;
         var parts = [];
         var hadErrors = false;
+        var pendingJobs = getPendingJobs(state);
+        var retainedPendingJobs = [];
+        var removedTerminalJobs = 0;
+        var pendingIndex;
+        var cleanupSummary;
+        var modal;
+        var title;
+        var text;
+        var cancelButton;
+        var confirmButton;
 
         if (isVideoGenerating || isImageGenerating || isResumingPendingJobs) {
             setStatus("Cleanup is blocked while generation is running.", true);
+            return;
+        }
+        if (isPendingJobsLeaseActive(activeLease)) {
+            setStatus("Cleanup is blocked while another Gallery owns the generation queue.", true);
             return;
         }
         if (!fs || !path) {
             setStatus("Cleanup is unavailable in this environment.", true);
             return;
         }
-        closeCleanupConfirmModal();
+        for (pendingIndex = 0; pendingIndex < pendingJobs.length; pendingIndex += 1) {
+            var cleanupStatus = normalizeVideoJobStatus(pendingJobs[pendingIndex] && pendingJobs[pendingIndex].status);
+            if (isActivePendingJob(pendingJobs[pendingIndex]) || (pendingJobs[pendingIndex] && (pendingJobs[pendingIndex].operationName || pendingJobs[pendingIndex].operationUrl)) ||
+                    cleanupStatus === "waiting_resume" || cleanupStatus === "needs_review" || cleanupStatus === "quota_paused" || cleanupStatus === "paused") {
+                retainedPendingJobs.push(pendingJobs[pendingIndex]);
+            } else {
+                removedTerminalJobs += 1;
+            }
+        }
 
         pruneResult = pruneStateForCleanup(state);
         pruneStats = pruneResult.stats;
@@ -1534,7 +1643,7 @@
             selectedVideoId: pruneResult.patch.selectedVideoId || null,
             images: pruneResult.patch.images || [],
             selectedImageId: pruneResult.patch.selectedImageId || null,
-            pendingJobs: getPendingJobs(state)
+            pendingJobs: retainedPendingJobs
         };
 
         orphanResult = cleanupOrphanFilesForState(cleanState);
@@ -1543,9 +1652,11 @@
         undoDeleteStack = [];
         updateUndoDeleteButtonState();
 
+        pruneResult.patch.pendingJobs = retainedPendingJobs;
         stateAdapterUpdate(pruneResult.patch);
 
         parts.push("State cleaned");
+        parts.push("failed jobs -" + String(removedTerminalJobs));
         parts.push("shots -" + String(pruneStats.removedShots));
         parts.push("videos -" + String(pruneStats.removedVideos));
         parts.push("images -" + String(pruneStats.removedImages));
@@ -1559,7 +1670,21 @@
             parts.push("failed deletions " + String(orphanResult.failed + trashResult.failed));
         }
 
-        setStatus(parts.join(" | "), hadErrors);
+        cleanupSummary = parts.join(" | ");
+        setStatus(cleanupSummary, hadErrors);
+
+        modal = getById("cleanupConfirmModal");
+        title = getById("cleanupConfirmTitle");
+        text = getById("cleanupConfirmText");
+        cancelButton = getById("btnCleanupCancel");
+        confirmButton = getById("btnCleanupConfirm");
+        if (modal) {
+            if (title) { title.textContent = hadErrors ? "Cleanup completed with errors" : "Cleanup complete"; }
+            if (text) { text.textContent = cleanupSummary; }
+            if (cancelButton) { cancelButton.textContent = "Close"; }
+            if (confirmButton) { confirmButton.hidden = true; }
+            modal.hidden = false;
+        }
     }
 
     function resolveErrorMessage(reason) {
@@ -1849,24 +1974,8 @@
         return entry.display;
     }
 
-    function isHighLoadErrorMessage(message) {
-        var text = String(message || "");
-        return /HTTP\s*429/i.test(text) ||
-            /rate limit/i.test(text) ||
-            /quota/i.test(text) ||
-            /resource exhausted/i.test(text) ||
-            /high load/i.test(text) ||
-            /overload/i.test(text) ||
-            /capacity/i.test(text) ||
-            /temporarily unavailable/i.test(text);
-    }
-
     function toCardErrorMessage(errorLike) {
-        var text = formatError(errorLike);
-        if (isHighLoadErrorMessage(text)) {
-            return CARD_HIGH_LOAD_MESSAGE;
-        }
-        return text;
+        return formatError(errorLike);
     }
 
     function playInlineVideoPreview(videoEl) {
@@ -2274,6 +2383,17 @@
         return window.VeoBridgeState.getState();
     }
 
+    function loadFreshState() {
+        var adapter = getStateAdapter();
+        if (adapter && typeof adapter.loadState === "function") {
+            return adapter.loadState();
+        }
+        if (window.VeoBridgeState && typeof window.VeoBridgeState.loadState === "function") {
+            return window.VeoBridgeState.loadState();
+        }
+        return getState();
+    }
+
     function cloneJson(value, fallback) {
         try {
             return JSON.parse(JSON.stringify(value));
@@ -2592,58 +2712,98 @@
         return !!(lease && lease.ownerId && lease.ownerId === pendingJobsRunnerId);
     }
 
-    function writePendingJobsLease(lease) {
-        stateAdapterUpdate({
-            pendingJobsLease: lease || null
-        });
-    }
-
     function acquirePendingJobsLease() {
-        var state = getState();
-        var lease = getPendingJobsLease(state);
         var nowMs = new Date().getTime();
         var nextLease;
         var verifiedLease;
-
-        if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
-            return false;
-        }
+        var adapter = getStateAdapter();
+        var acquired = false;
 
         nextLease = {
             ownerId: pendingJobsRunnerId,
+            runId: pendingJobsRunId,
+            buildId: RUNTIME_BUILD_ID,
+            activeJobId: pendingJobsCurrentJobId,
+            lastProgressAt: pendingJobsLastProgressAtMs ? (new Date(pendingJobsLastProgressAtMs)).toISOString() : null,
             expiresAt: nowMs + PENDING_JOBS_LEASE_TTL_MS,
             updatedAt: (new Date(nowMs)).toISOString()
         };
 
-        writePendingJobsLease(nextLease);
+        if (adapter && typeof adapter.updateStateWith === "function") {
+            adapter.updateStateWith(function (latestState) {
+                var lease = getPendingJobsLease(latestState);
+                if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                    return {};
+                }
+                acquired = true;
+                return { pendingJobsLease: nextLease };
+            });
+        } else {
+            var state = getState();
+            var lease = getPendingJobsLease(state);
+            if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                return false;
+            }
+            stateAdapterUpdate({ pendingJobsLease: nextLease });
+            acquired = true;
+        }
+        if (!acquired) { return false; }
         verifiedLease = getPendingJobsLease(getState());
         return !!(verifiedLease && verifiedLease.ownerId === pendingJobsRunnerId && isPendingJobsLeaseActive(verifiedLease));
     }
 
     function refreshPendingJobsLease() {
+        var nowMs = new Date().getTime();
+        var adapter = getStateAdapter();
+        var refreshed = false;
+        var nextLease = {
+            ownerId: pendingJobsRunnerId,
+            runId: pendingJobsRunId,
+            buildId: RUNTIME_BUILD_ID,
+            activeJobId: pendingJobsCurrentJobId,
+            lastProgressAt: pendingJobsLastProgressAtMs ? (new Date(pendingJobsLastProgressAtMs)).toISOString() : null,
+            expiresAt: nowMs + PENDING_JOBS_LEASE_TTL_MS,
+            updatedAt: (new Date(nowMs)).toISOString()
+        };
+
+        if (adapter && typeof adapter.updateStateWith === "function") {
+            adapter.updateStateWith(function (latestState) {
+                var lease = getPendingJobsLease(latestState);
+                if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                    return {};
+                }
+                refreshed = true;
+                return { pendingJobsLease: nextLease };
+            });
+            return refreshed;
+        }
+
         var state = getState();
         var lease = getPendingJobsLease(state);
-        var nowMs = new Date().getTime();
-
         if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
             return false;
         }
-
-        writePendingJobsLease({
-            ownerId: pendingJobsRunnerId,
-            expiresAt: nowMs + PENDING_JOBS_LEASE_TTL_MS,
-            updatedAt: (new Date(nowMs)).toISOString()
-        });
+        stateAdapterUpdate({ pendingJobsLease: nextLease });
         return true;
     }
 
     function releasePendingJobsLease() {
-        var state = getState();
-        var lease = getPendingJobsLease(state);
-        if (!lease || !lease.ownerId || lease.ownerId !== pendingJobsRunnerId) {
+        var adapter = getStateAdapter();
+        if (adapter && typeof adapter.updateStateWith === "function") {
+            adapter.updateStateWith(function (latestState) {
+                var lease = getPendingJobsLease(latestState);
+                if (!lease || !lease.ownerId || lease.ownerId !== pendingJobsRunnerId) {
+                    return {};
+                }
+                return { pendingJobsLease: null };
+            });
             return;
         }
-        writePendingJobsLease(null);
+        var state = getState();
+        var lease = getPendingJobsLease(state);
+        if (lease && lease.ownerId === pendingJobsRunnerId) {
+            stateAdapterUpdate({ pendingJobsLease: null });
+        }
     }
 
     function startPendingJobsLeaseHeartbeat() {
@@ -2655,7 +2815,14 @@
             return;
         }
         pendingJobsLeaseHeartbeatTimer = window.setInterval(function () {
-            if (!isVideoGenerating) {
+            var nowMs = new Date().getTime();
+            if (!isVideoGenerating || !pendingJobsCurrentJobId) {
+                return;
+            }
+            if (!pendingJobsLastProgressAtMs || (nowMs - pendingJobsLastProgressAtMs) > PENDING_JOBS_PROGRESS_WATCHDOG_MS) {
+                stopPendingJobsLeaseHeartbeat();
+                releasePendingJobsLease();
+                setGenerationStatus("Generation worker stopped responding. The job is available for recovery.", true);
                 return;
             }
             if (!refreshPendingJobsLease()) {
@@ -2676,7 +2843,8 @@
         if (ACTIVE_VIDEO_JOB_STATUSES[status]) {
             return status;
         }
-        if (status === "done" || status === "failed" || status === "cancelled") {
+        if (status === "done" || status === "failed" || status === "cancelled" || status === "paused" ||
+                status === "waiting_resume" || status === "needs_review" || status === "quota_paused" || status === "stopped_tracking") {
             return status;
         }
         return "queued";
@@ -2714,15 +2882,27 @@
     }
 
     function mutatePendingJobs(mutator) {
-        var state = getState();
-        var jobs = getPendingJobs(state).slice(0);
-        var next = mutator && typeof mutator === "function" ? mutator(jobs) : jobs;
-        if (!(next instanceof Array)) {
-            next = jobs;
+        var result = null;
+        var adapter = getStateAdapter();
+        if (adapter && typeof adapter.updateStateWith === "function") {
+            adapter.updateStateWith(function (latestState) {
+                var jobs = getPendingJobs(latestState).slice(0);
+                var next = mutator && typeof mutator === "function" ? mutator(jobs) : jobs;
+                if (!(next instanceof Array)) {
+                    next = jobs;
+                }
+                result = trimPendingJobs(next);
+                return { pendingJobs: result };
+            });
+            return result || [];
         }
-        next = trimPendingJobs(next);
-        stateAdapterUpdate({ pendingJobs: next });
-        return next;
+        var state = getState();
+        var fallbackJobs = getPendingJobs(state).slice(0);
+        result = mutator && typeof mutator === "function" ? mutator(fallbackJobs) : fallbackJobs;
+        if (!(result instanceof Array)) { result = fallbackJobs; }
+        result = trimPendingJobs(result);
+        stateAdapterUpdate({ pendingJobs: result });
+        return result;
     }
 
     function upsertPendingJob(job) {
@@ -2757,43 +2937,7 @@
                 if (!item || item.id !== jobId) {
                     continue;
                 }
-                next[i] = {
-                    id: item.id,
-                    kind: item.kind,
-                    batchId: item.batchId,
-                    status: item.status,
-                    sampleIndex: item.sampleIndex,
-                    sampleCount: item.sampleCount,
-                    createdAt: item.createdAt,
-                    updatedAt: item.updatedAt,
-                    prompt: item.prompt,
-                    modelId: item.modelId,
-                    aspectRatio: item.aspectRatio,
-                    imageSize: item.imageSize,
-                    uiMode: item.uiMode,
-                    apiMode: item.apiMode,
-                    durationSeconds: item.durationSeconds,
-                    resolution: item.resolution,
-                    videosDir: item.videosDir,
-                    startShotId: item.startShotId,
-                    endShotId: item.endShotId,
-                    startShotPath: item.startShotPath,
-                    endShotPath: item.endShotPath,
-                    startShotCompName: item.startShotCompName,
-                    endShotCompName: item.endShotCompName,
-                    startShotFrame: item.startShotFrame,
-                    endShotFrame: item.endShotFrame,
-                    references: item.references || [],
-                    referenceIds: item.referenceIds || [],
-                    operationName: item.operationName,
-                    operationUrl: item.operationUrl,
-                    requestMode: item.requestMode,
-                    fallbackReason: item.fallbackReason,
-                    downloadedPath: item.downloadedPath,
-                    progressPercent: item.progressPercent,
-                    lastStage: item.lastStage,
-                    error: item.error
-                };
+                next[i] = cloneJson(item, {});
                 if (patch && typeof patch === "object") {
                     var key;
                     for (key in patch) {
@@ -2905,6 +3049,78 @@
         return PENDING_VIDEO_JOB_STALE_ACTIVE_MS;
     }
 
+    function preparePendingVideoRecovery() {
+        var state = getState();
+        var lease = getPendingJobsLease(state);
+        var jobs = getPendingJobs(state);
+        var needsRecovery = false;
+        var changed = false;
+        var scanIndex;
+        var scanJob;
+        var scanStatus;
+        var scanHasOperation;
+        if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+            return false;
+        }
+        for (scanIndex = 0; scanIndex < jobs.length; scanIndex += 1) {
+            scanJob = jobs[scanIndex];
+            if (!scanJob || scanJob.kind !== "video") { continue; }
+            scanStatus = normalizeVideoJobStatus(scanJob.status);
+            scanHasOperation = !!(scanJob.operationName || scanJob.operationUrl);
+            if ((scanStatus === "queued" && !scanHasOperation) ||
+                    ((scanStatus === "uploading" || scanStatus === "polling") && !scanHasOperation) ||
+                    (scanStatus === "importing" && scanHasOperation) || scanJob.claimedBy || scanJob.claimExpiresAt) {
+                needsRecovery = true;
+                break;
+            }
+        }
+        if (!needsRecovery) {
+            return false;
+        }
+        mutatePendingJobs(function (jobs) {
+            var next = jobs.slice(0);
+            var i;
+            var item;
+            var status;
+            var hasOperation;
+            var itemChanged;
+            for (i = 0; i < next.length; i += 1) {
+                item = next[i];
+                if (!item || item.kind !== "video") { continue; }
+                itemChanged = false;
+                status = normalizeVideoJobStatus(item.status);
+                hasOperation = !!(item.operationName || item.operationUrl);
+                if (status === "queued" && !hasOperation) {
+                    item.status = "waiting_resume";
+                    item.resumeRequired = true;
+                    item.recoveryReason = "This request was not sent before Gallery closed. Press Resume to submit it.";
+                    changed = true;
+                    itemChanged = true;
+                } else if ((status === "uploading" || status === "polling") && !hasOperation) {
+                    item.status = "needs_review";
+                    item.resumeRequired = true;
+                    item.recoveryReason = "Submission was interrupted before an operation name was saved.";
+                    changed = true;
+                    itemChanged = true;
+                } else if (status === "importing" && hasOperation) {
+                    item.status = "downloading";
+                    item.resumeRequired = false;
+                    changed = true;
+                    itemChanged = true;
+                }
+                if (item.claimedBy || item.claimExpiresAt) {
+                    item.claimedBy = null;
+                    item.claimExpiresAt = null;
+                    changed = true;
+                    itemChanged = true;
+                }
+                if (itemChanged) { item.updatedAt = (new Date()).toISOString(); }
+            }
+            return next;
+        });
+        return changed;
+    }
+
     function markStalePendingJobs(options) {
         var opts = options || {};
         var state = opts.state || getState();
@@ -2940,6 +3156,11 @@
             if (!item || !item.id || !isActivePendingJob(item)) {
                 continue;
             }
+            if (item.kind === "video") {
+                if (item.operationName || item.operationUrl || normalizeVideoJobStatus(item.status) === "queued") {
+                    continue;
+                }
+            }
             itemUpdatedAtMs = getPendingJobUpdatedMs(item);
             staleThresholdMs = getPendingJobStaleThresholdMs(item);
             if (!isFinite(itemUpdatedAtMs) || itemUpdatedAtMs <= 0) {
@@ -2972,43 +3193,16 @@
             if (!isActivePendingJob(item)) {
                 continue;
             }
-            nextJobs[i] = {
-                id: item.id,
-                kind: item.kind,
-                batchId: item.batchId,
-                status: "failed",
-                sampleIndex: item.sampleIndex,
-                sampleCount: item.sampleCount,
-                createdAt: item.createdAt,
-                updatedAt: (new Date()).toISOString(),
-                prompt: item.prompt,
-                modelId: item.modelId,
-                aspectRatio: item.aspectRatio,
-                imageSize: item.imageSize,
-                uiMode: item.uiMode,
-                apiMode: item.apiMode,
-                durationSeconds: item.durationSeconds,
-                resolution: item.resolution,
-                videosDir: item.videosDir,
-                startShotId: item.startShotId,
-                endShotId: item.endShotId,
-                startShotPath: item.startShotPath,
-                endShotPath: item.endShotPath,
-                startShotCompName: item.startShotCompName,
-                endShotCompName: item.endShotCompName,
-                startShotFrame: item.startShotFrame,
-                endShotFrame: item.endShotFrame,
-                references: item.references || [],
-                referenceIds: item.referenceIds || [],
-                operationName: item.operationName,
-                operationUrl: item.operationUrl,
-                requestMode: item.requestMode,
-                fallbackReason: item.fallbackReason,
-                downloadedPath: item.downloadedPath,
-                progressPercent: 0,
-                lastStage: "Interrupted",
-                error: CARD_INTERRUPTED_MESSAGE
-            };
+            nextJobs[i] = cloneJson(item, {});
+            nextJobs[i].status = item.kind === "video" ? "needs_review" : "failed";
+            nextJobs[i].updatedAt = (new Date()).toISOString();
+            nextJobs[i].progressPercent = 0;
+            nextJobs[i].lastStage = item.kind === "video" ? "Needs review" : "Interrupted";
+            nextJobs[i].error = CARD_INTERRUPTED_MESSAGE;
+            nextJobs[i].resumeRequired = item.kind === "video";
+            nextJobs[i].recoveryReason = item.kind === "video" ? "Submission stopped before an operation name was saved." : null;
+            nextJobs[i].claimedBy = null;
+            nextJobs[i].claimExpiresAt = null;
             staleCount += 1;
             changed = true;
         }
@@ -3020,7 +3214,7 @@
         }
 
         if (staleCount > 0 && opts.notify !== false) {
-            setStatus("Detected interrupted jobs. Marked " + staleCount + " pending item(s) as failed.", true);
+            setStatus("Detected interrupted jobs. Moved " + staleCount + " pending item(s) to a safe recovery state.", true);
         }
 
         return {
@@ -3049,6 +3243,9 @@
 
     function mapVideoStageToJobStatus(stage) {
         var text = trimText(stage).toLowerCase();
+        if (text.indexOf("download") !== -1) {
+            return "downloading";
+        }
         if (text.indexOf("poll") === 0) {
             return "polling";
         }
@@ -3074,7 +3271,8 @@
             model: trimText(source.model || (window.VeoApi ? window.VeoApi.DEFAULT_MODEL_ID : MODEL_VEO_31)) || MODEL_VEO_31,
             aspectRatio: normalizeAspectRatio(source.aspectRatio || "16:9"),
             durationSeconds: parseInt(source.durationSeconds, 10) || 8,
-            resolution: String(source.resolution || "720p").toLowerCase()
+            resolution: String(source.resolution || "720p").toLowerCase(),
+            seed: typeof source.seed === "number" ? source.seed : null
         };
     }
 
@@ -3115,6 +3313,8 @@
     }
 
     function getVideoGenerationConstraints(context) {
+        var policy = window.VeoBridgeModelPolicy;
+        var policyResult;
         var constraints = {
             allowReferenceMode: true,
             allowedDurations: [4, 6, 8],
@@ -3123,6 +3323,20 @@
             message: ""
         };
         var isInterpolation = context.mode === VIDEO_MODE_FRAMES && context.hasStart && context.hasEnd;
+
+        if (policy && typeof policy.getVideoConstraints === "function") {
+            policyResult = policy.getVideoConstraints(context);
+            constraints.allowReferenceMode = policyResult.allowReferenceMode;
+            constraints.allowedDurations = policyResult.allowedDurations;
+            constraints.allowedResolutions = policyResult.allowedResolutions;
+            constraints.allowedAspectRatios = policyResult.allowedAspectRatios;
+            if (!constraints.allowReferenceMode && context.mode === VIDEO_MODE_REFERENCE) {
+                constraints.message = "Veo 3.1 Lite does not support Ingredients mode.";
+            } else if (context.mode === VIDEO_MODE_REFERENCE) {
+                constraints.message = "Reference Images mode requires an 8s clip.";
+            }
+            return constraints;
+        }
 
         if (!context.isVeo31Family) {
             constraints.allowedResolutions = ["720p", "1080p"];
@@ -4044,13 +4258,32 @@
             return "Cancelled";
         }
         if (normalized === "queued") {
-            return "Idle";
+            var lease = getPendingJobsLease(getState());
+            if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                return "Blocked by another Gallery";
+            }
+            return "Queued";
+        }
+        if (normalized === "waiting_resume") {
+            return "Waiting for Resume";
+        }
+        if (normalized === "needs_review") {
+            return "Needs Review";
+        }
+        if (normalized === "quota_paused") {
+            return "Quota paused";
+        }
+        if (normalized === "paused") {
+            return "Paused";
+        }
+        if (normalized === "stopped_tracking") {
+            return "Tracking stopped";
         }
         if (normalized === "uploading") {
             return "Uploading";
         }
         if (normalized === "polling") {
-            return "Generating";
+            return "Polling";
         }
         if (normalized === "downloading") {
             return "Downloading";
@@ -4066,10 +4299,10 @@
 
     function getVideoJobStateClass(status) {
         var normalized = normalizeVideoJobStatus(status);
-        if (normalized === "failed" || normalized === "cancelled") {
+        if (normalized === "failed" || normalized === "cancelled" || normalized === "needs_review" || normalized === "quota_paused") {
             return "error";
         }
-        if (normalized === "queued") {
+        if (normalized === "queued" || normalized === "waiting_resume" || normalized === "paused" || normalized === "stopped_tracking") {
             return "idle";
         }
         return "generating";
@@ -4153,10 +4386,20 @@
                 items: [],
                 pendingJobsCount: 0,
                 activePendingJobsCount: 0,
+                hasManualResumeJobs: false,
+                hasNeedsReviewJobs: false,
+                hasUnsentPendingJobs: false,
+                hasTrackedOperation: false,
+                hasClearableJobs: false,
                 hasPendingJobs: false,
                 stateClass: "done",
                 stateLabel: "Done",
-                error: ""
+                error: "",
+                errorDetails: "",
+                errorStatusCode: null,
+                requestTransport: "",
+                operationName: "",
+                attemptCount: 0
             };
             map[groupKey] = next;
             groups.push(next);
@@ -4212,9 +4455,6 @@
                     videoProgress = videoStageFallback;
                 }
                 videoProgress = smoothProgressForJob(item.id, videoProgress, videoJobStateClass, activeProgressJobIds, videoStageHint, isVideoProgressExact);
-                if (isHighLoadErrorMessage(videoJobError)) {
-                    videoJobError = CARD_HIGH_LOAD_MESSAGE;
-                }
                 if (videoJobStateClass === "error") {
                     if (!videoJobLabel) {
                         videoJobLabel = "Error";
@@ -4259,8 +4499,39 @@
                     }
                 }
                 group.pendingJobsCount += 1;
+                group.requestTransport = group.requestTransport || trimText(item.requestTransport || "");
+                group.operationName = group.operationName || trimText(item.operationName || "");
+                group.errorStatusCode = group.errorStatusCode || item.errorStatusCode || null;
+                group.attemptCount = Math.max(group.attemptCount || 0, item.attemptCount || 0);
+                if (!group.errorDetails && (item.originalErrorMessage || item.errorDetails || item.recoveryReason || item.errorPayload)) {
+                    var pendingDetailParts = [];
+                    if (item.originalErrorMessage) { pendingDetailParts.push(String(item.originalErrorMessage)); }
+                    if (item.errorDetails && String(item.errorDetails) !== String(item.originalErrorMessage || "")) { pendingDetailParts.push(String(item.errorDetails)); }
+                    if (item.recoveryReason) { pendingDetailParts.push(String(item.recoveryReason)); }
+                    if (item.errorPayload) {
+                        try { pendingDetailParts.push(JSON.stringify(item.errorPayload)); } catch (pendingPayloadError) {}
+                    }
+                    group.errorDetails = pendingDetailParts.join("\n");
+                }
                 if (ACTIVE_VIDEO_JOB_STATUSES[normalizeVideoJobStatus(item.status)]) {
                     group.activePendingJobsCount += 1;
+                }
+                if (normalizeVideoJobStatus(item.status) === "waiting_resume" || normalizeVideoJobStatus(item.status) === "paused" ||
+                        normalizeVideoJobStatus(item.status) === "quota_paused" || normalizeVideoJobStatus(item.status) === "needs_review") {
+                    group.hasManualResumeJobs = true;
+                }
+                if (normalizeVideoJobStatus(item.status) === "needs_review") {
+                    group.hasNeedsReviewJobs = true;
+                }
+                if (normalizeVideoJobStatus(item.status) === "queued" || normalizeVideoJobStatus(item.status) === "waiting_resume" ||
+                        normalizeVideoJobStatus(item.status) === "paused" || normalizeVideoJobStatus(item.status) === "quota_paused") {
+                    group.hasUnsentPendingJobs = true;
+                }
+                if (item.operationName || item.operationUrl) {
+                    group.hasTrackedOperation = true;
+                } else if (normalizeVideoJobStatus(item.status) !== "needs_review" && normalizeVideoJobStatus(item.status) !== "uploading" && normalizeVideoJobStatus(item.status) !== "polling" &&
+                        normalizeVideoJobStatus(item.status) !== "downloading" && normalizeVideoJobStatus(item.status) !== "importing") {
+                    group.hasClearableJobs = true;
                 }
 
                 createdAt = item.updatedAt || item.createdAt || "";
@@ -4275,6 +4546,10 @@
                     stateLabel: videoJobLabel,
                     stateClass: videoJobStateClass,
                     error: videoJobError,
+                    operationName: item.operationName || null,
+                    requestTransport: item.requestTransport || null,
+                    errorStatusCode: item.errorStatusCode || null,
+                    attemptCount: item.attemptCount || 0,
                     progressPercent: videoProgress,
                     aspectRatio: normalizeAspectRatio(item.aspectRatio || group.aspectRatio || "16:9"),
                     previewPath: item.startShotPath || item.endShotPath || ((item.references && item.references[0] && item.references[0].path) ? item.references[0].path : "")
@@ -4298,9 +4573,6 @@
                 imageProgress = imageStageFallback;
             }
             imageProgress = smoothProgressForJob(item.id, imageProgress, imageJobStateClass, activeProgressJobIds, imageStageHint, isImageProgressExact);
-            if (isHighLoadErrorMessage(imageJobError)) {
-                imageJobError = CARD_HIGH_LOAD_MESSAGE;
-            }
             if (imageJobStateClass === "error") {
                 if (!imageJobLabel) {
                     imageJobLabel = "Error";
@@ -4328,6 +4600,8 @@
             group.pendingJobsCount += 1;
             if (ACTIVE_VIDEO_JOB_STATUSES[normalizeVideoJobStatus(item.status)]) {
                 group.activePendingJobsCount += 1;
+            } else {
+                group.hasClearableJobs = true;
             }
 
             createdAt = item.updatedAt || item.createdAt || "";
@@ -4821,6 +5095,10 @@
                     revealSelectedVideo(mediaId);
                     return;
                 }
+                if (actionId === "extend") {
+                    extendGeneratedVideo(mediaId);
+                    return;
+                }
                 deleteSelectedVideo(mediaId);
                 return;
             }
@@ -4842,39 +5120,228 @@
         });
     }
 
+    function extendGeneratedVideo(videoId) {
+        var state = getState();
+        var video = findVideoById(state.videos || [], videoId || state.selectedVideoId);
+        var apiKey = getApiKeyFromStorage();
+
+        if (!video || !video.path) {
+            setStatus("Select a generated video to extend.", true);
+            return;
+        }
+        if (video.model !== MODEL_VEO_31 && video.model !== MODEL_VEO_31_FAST) {
+            setStatus("Extend is available only for Veo 3.1 and Veo 3.1 Fast videos.", true);
+            return;
+        }
+        if (!fileExists(video.path)) {
+            setStatus("Source video file is missing: " + video.path, true);
+            return;
+        }
+        if (!/\.mp4$/i.test(video.path)) {
+            setStatus("Extend requires a locally saved MP4 source video.", true);
+            return;
+        }
+        if (!apiKey) {
+            setStatus("API key is missing. Open Settings in the main panel.", true);
+            return;
+        }
+
+        var modal = getById("extendModal");
+        var sourceLabel = getById("extendSourceLabel");
+        var promptField = getById("extendPromptInput");
+        var seedField = getById("extendSeedInput");
+        pendingExtendVideoId = video.id;
+        if (sourceLabel) { sourceLabel.textContent = baseName(video.path); }
+        if (promptField) { promptField.value = "Continue the scene naturally"; }
+        if (seedField) { seedField.value = typeof getVideoGenSettings(state).seed === "number" ? String(getVideoGenSettings(state).seed) : ""; }
+        if (modal) { modal.hidden = false; }
+        closeMediaPreview();
+    }
+
+    function confirmExtendGeneratedVideo() {
+        var state = getState();
+        var video = findVideoById(state.videos || [], pendingExtendVideoId);
+        var promptField = getById("extendPromptInput");
+        var seedField = getById("extendSeedInput");
+        var prompt = trimText(promptField ? promptField.value : "");
+        var seedRaw = trimText(seedField ? seedField.value : "");
+        var seed = seedRaw === "" ? null : Number(seedRaw);
+        var apiKey = getApiKeyFromStorage();
+        var jobs;
+        var jobIds = [];
+        var input;
+        var i;
+        if (!video || !fileExists(video.path)) { setStatus("Extend source video is missing.", true); return; }
+        if (!apiKey) { setStatus("API key is missing. Open Settings in the main panel.", true); return; }
+        if (!prompt) { setStatus("Extend prompt is empty.", true); return; }
+        if (seed !== null && (!isFinite(seed) || Math.floor(seed) !== seed)) { setStatus("Seed must be an integer.", true); return; }
+
+        input = {
+            apiKey: apiKey,
+            prompt: prompt,
+            sampleCount: 1,
+            modelId: video.model,
+            aspectRatio: normalizeAspectRatio(video.aspectRatio || "16:9"),
+            mode: "extend",
+            durationSeconds: 8,
+            resolution: "720p",
+            seed: seed,
+            videosDir: resolveLibraryVideosDir(),
+            sourceVideoId: video.id,
+            sourceVideoPath: video.path,
+            references: [],
+            referenceIds: [],
+            batchId: makeId("video_extend_batch")
+        };
+        jobs = enqueueVideoGenerationJobs(input);
+        for (i = 0; i < jobs.length; i += 1) {
+            jobIds.push(jobs[i].id);
+        }
+        getById("extendModal").hidden = true;
+        pendingExtendVideoId = "";
+        if (isVideoGenerating || isResumingPendingJobs) {
+            queueInjectedVideoJobIds(jobIds);
+            setStatus("Video extension queued.", false);
+            return;
+        }
+        runPendingVideoJobs({ jobIds: jobIds, stopOnError: false, concurrency: 1, isResume: false, allowQueued: true });
+    }
+
     function clearPendingJobsForGroup(groupKey) {
         var normalizedKey = trimText(groupKey || "");
-        var state;
-        var jobs;
-        var next;
         var removedCount = 0;
+        var protectedCount = 0;
+        if (!normalizedKey) {
+            return { removed: 0, protected: 0 };
+        }
+        mutatePendingJobs(function (jobs) {
+            var next = [];
+            var i;
+            var item;
+            var itemBatchKey;
+            var status;
+            var claimExpiresAt;
+            for (i = 0; i < jobs.length; i += 1) {
+                item = jobs[i];
+                if (!item || !item.id) { continue; }
+                itemBatchKey = (item.kind === "image" ? "image:" : "video:") + (item.batchId || item.id);
+                if (itemBatchKey !== normalizedKey) {
+                    next.push(item);
+                    continue;
+                }
+                status = normalizeVideoJobStatus(item.status);
+                claimExpiresAt = parseInt(item.claimExpiresAt, 10) || 0;
+                if (item.operationName || item.operationUrl || status === "needs_review" || status === "uploading" || status === "polling" || status === "downloading" || status === "importing" ||
+                        (item.claimedBy && claimExpiresAt > new Date().getTime())) {
+                    protectedCount += 1;
+                    next.push(item);
+                    continue;
+                }
+                removedCount += 1;
+            }
+            return next;
+        });
+        return { removed: removedCount, protected: protectedCount };
+    }
+
+    function resumePendingJobsForGroup(groupKey) {
+        var normalizedKey = trimText(groupKey || "");
+        var state = getState();
+        var jobs = getPendingJobs(state);
+        var requiresWarning = false;
+        var resumed = 0;
         var i;
         var item;
         var itemBatchKey;
-        if (!normalizedKey) {
-            return 0;
-        }
-        state = getState();
-        jobs = getPendingJobs(state);
-        next = [];
+        if (!normalizedKey) { return 0; }
         for (i = 0; i < jobs.length; i += 1) {
             item = jobs[i];
-            if (!item || !item.id) {
-                continue;
-            }
+            if (!item) { continue; }
             itemBatchKey = (item.kind === "image" ? "image:" : "video:") + (item.batchId || item.id);
-            if (itemBatchKey === normalizedKey) {
-                removedCount += 1;
-                continue;
+            if (itemBatchKey === normalizedKey && normalizeVideoJobStatus(item.status) === "needs_review") {
+                requiresWarning = true;
+                break;
             }
-            next.push(item);
         }
-        if (removedCount > 0) {
-            stateAdapterUpdate({
-                pendingJobs: trimPendingJobs(next)
-            });
+        if (requiresWarning && typeof window.confirm === "function" && !window.confirm("Google may already have accepted one interrupted request. Retry can create an additional billable video. Retry this batch anyway?")) {
+            return 0;
         }
-        return removedCount;
+        mutatePendingJobs(function (currentJobs) {
+            var next = currentJobs.slice(0);
+            var idx;
+            var candidate;
+            var key;
+            var status;
+            for (idx = 0; idx < next.length; idx += 1) {
+                candidate = next[idx];
+                if (!candidate || candidate.kind !== "video") { continue; }
+                key = "video:" + (candidate.batchId || candidate.id);
+                status = normalizeVideoJobStatus(candidate.status);
+                if (key !== normalizedKey || (status !== "waiting_resume" && status !== "paused" && status !== "quota_paused" && status !== "needs_review")) { continue; }
+                candidate.status = "queued";
+                candidate.resumeRequired = false;
+                candidate.recoveryReason = null;
+                candidate.error = null;
+                candidate.claimedBy = null;
+                candidate.claimExpiresAt = null;
+                candidate.updatedAt = (new Date()).toISOString();
+                resumed += 1;
+            }
+            return next;
+        });
+        if (resumed > 0) {
+            runPendingVideoJobs({ stopOnError: false, concurrency: 1, isResume: true, allowQueued: true });
+        }
+        return resumed;
+    }
+
+    function stopTrackingOperationsForGroup(groupKey) {
+        var normalizedKey = trimText(groupKey || "");
+        var removed = 0;
+        var currentState = getState();
+        var lease = getPendingJobsLease(currentState);
+        var currentJobs = getPendingJobs(currentState);
+        var hasNeedsReview = false;
+        var scanIndex;
+        var scanItem;
+        var scanKey;
+        if (!normalizedKey) { return 0; }
+        if (isPendingJobsLeaseActive(lease)) {
+            setStatus("Stop tracking is disabled while a Gallery worker owns the queue.", true);
+            return 0;
+        }
+        for (scanIndex = 0; scanIndex < currentJobs.length; scanIndex += 1) {
+            scanItem = currentJobs[scanIndex];
+            if (!scanItem || scanItem.kind !== "video") { continue; }
+            scanKey = "video:" + (scanItem.batchId || scanItem.id);
+            if (scanKey === normalizedKey && normalizeVideoJobStatus(scanItem.status) === "needs_review") {
+                hasNeedsReview = true;
+                break;
+            }
+        }
+        if (typeof window.confirm === "function" && !window.confirm(hasNeedsReview
+                ? "Stop tracking this uncertain submission? Google may still be processing it, but Veo Bridge has no operation name and will forget the review record."
+                : "Stop tracking this Google operation? Veo Bridge will no longer poll or download its result. This does not cancel generation or charges at Google.")) {
+            return 0;
+        }
+        mutatePendingJobs(function (jobs) {
+            var next = [];
+            var i;
+            var item;
+            var key;
+            for (i = 0; i < jobs.length; i += 1) {
+                item = jobs[i];
+                if (!item) { continue; }
+                key = (item.kind === "image" ? "image:" : "video:") + (item.batchId || item.id);
+                if (key === normalizedKey && (item.operationName || item.operationUrl || normalizeVideoJobStatus(item.status) === "needs_review") && item.claimedBy !== pendingJobsRunnerId) {
+                    removed += 1;
+                    continue;
+                }
+                next.push(item);
+            }
+            return next;
+        });
+        return removed;
     }
 
     function deleteBatchGroup(group) {
@@ -4902,6 +5369,14 @@
 
         if (group && group.activePendingJobsCount > 0) {
             setStatus("Cannot delete a batch while generation is still running.", true);
+            return;
+        }
+        if (group && group.hasTrackedOperation) {
+            setStatus("This batch contains a Google operation. Use Stop tracking first so it cannot be forgotten accidentally.", true);
+            return;
+        }
+        if (group && group.hasNeedsReviewJobs) {
+            setStatus("This batch has an uncertain submission. Use Retry with warning or Stop tracking.", true);
             return;
         }
 
@@ -5033,6 +5508,7 @@
     function renderVideosList(state) {
         var list = getById("videosList");
         var groups = collectUnifiedMediaGroups(state);
+        var totalGroupCount = groups.length;
         var renderKeyParts = [];
         var renderKey = "";
         var groupRenderKeys = {};
@@ -5073,6 +5549,7 @@
         var itemStateLabelKey;
         var actionsVideo = [
             { id: "import", icon: "vb-icon-import", title: "Import to AE", tooltip: "Import", iconOnly: true },
+            { id: "extend", text: "+", title: "Extend Veo video", tooltip: "Extend", iconOnly: false },
             { id: "reveal", icon: "vb-icon-folder", title: "Reveal in file manager", tooltip: "Reveal", iconOnly: true },
             { id: "delete", icon: "vb-icon-close", title: "Delete media", tooltip: "Delete", iconOnly: true }
         ];
@@ -5084,7 +5561,11 @@
         var cardActions;
         var currentItem;
 
-        function appendMetaChip(container, text, modifier) {
+        if (groups.length > galleryGroupRenderLimit) {
+            groups = groups.slice(0, galleryGroupRenderLimit);
+        }
+
+        function appendMetaChip(container, text, modifier, title) {
             var chip;
             if (!container || !text) {
                 return;
@@ -5092,6 +5573,7 @@
             chip = document.createElement("span");
             chip.className = "flow-meta-chip" + (modifier ? (" " + modifier) : "");
             chip.textContent = text;
+            if (title) { chip.title = title; }
             container.appendChild(chip);
         }
 
@@ -5117,6 +5599,8 @@
             var builtReuseBtn;
             var builtDeleteBatchBtn;
             var builtClearPendingBtn;
+            var builtResumePendingBtn;
+            var builtStopTrackingBtn;
             var builtMiniThumbPath;
             var builtDisplayDate;
             var builtAspectClass;
@@ -5161,21 +5645,21 @@
                     builtMediaThumb.muted = true;
                     builtMediaThumb.defaultMuted = true;
                     builtMediaThumb.loop = true;
-                    builtMediaThumb.preload = "auto";
+                    builtMediaThumb.preload = "metadata";
                     builtMediaThumb.setAttribute("playsinline", "playsinline");
-                    builtMediaThumb.src = toFileUrl(builtCurrentItem.path);
+                    builtMediaThumb.setAttribute("data-media-src", toFileUrl(builtCurrentItem.path));
                     builtThumbWrap.appendChild(builtMediaThumb);
                 } else if (builtCurrentItem.kind === "image" && builtCurrentItem.path && builtCurrentItem.stateClass !== "missing") {
                     builtMediaThumb = document.createElement("img");
                     builtMediaThumb.className = "shot-thumb";
                     builtMediaThumb.alt = baseName(builtCurrentItem.path);
-                    builtMediaThumb.src = toFileUrl(builtCurrentItem.path);
+                    builtMediaThumb.setAttribute("data-media-src", toFileUrl(builtCurrentItem.path));
                     builtThumbWrap.appendChild(builtMediaThumb);
                 } else if (builtCurrentItem.previewPath && fileExists(builtCurrentItem.previewPath) && isSupportedImagePath(builtCurrentItem.previewPath)) {
                     builtMediaThumb = document.createElement("img");
                     builtMediaThumb.className = "shot-thumb";
                     builtMediaThumb.alt = "Preview";
-                    builtMediaThumb.src = toFileUrl(builtCurrentItem.previewPath);
+                    builtMediaThumb.setAttribute("data-media-src", toFileUrl(builtCurrentItem.previewPath));
                     builtThumbWrap.appendChild(builtMediaThumb);
                 } else {
                     builtMediaThumb = document.createElement("div");
@@ -5219,6 +5703,10 @@
                     builtMediaActions.className = "flow-group-actions";
                     builtCardActions = builtCurrentItem.kind === "image" ? actionsImage : actionsVideo;
                     for (builtA = 0; builtA < builtCardActions.length; builtA += 1) {
+                        if (builtCardActions[builtA].id === "extend" &&
+                                builtCurrentItem.model !== MODEL_VEO_31 && builtCurrentItem.model !== MODEL_VEO_31_FAST) {
+                            continue;
+                        }
                         builtActionBtn = document.createElement("button");
                         builtActionBtn.type = "button";
                         builtActionBtn.className = "video-card-action-btn";
@@ -5337,30 +5825,64 @@
             }(groupToRender)));
             builtActionsWrap.appendChild(builtDeleteBatchBtn);
 
-            if (groupToRender.hasPendingJobs) {
+            if (groupToRender.hasManualResumeJobs) {
+                builtResumePendingBtn = document.createElement("button");
+                builtResumePendingBtn.type = "button";
+                builtResumePendingBtn.className = "flow-reuse-btn";
+                builtResumePendingBtn.textContent = groupToRender.hasNeedsReviewJobs ? "Retry with warning" : "Resume";
+                builtResumePendingBtn.title = groupToRender.hasNeedsReviewJobs ? "Retry an uncertain submission; this may create another billable video" : "Resume this batch one sample at a time";
+                builtResumePendingBtn.addEventListener("click", (function (groupKeyCopy) {
+                    return function (event) {
+                        var resumed;
+                        if (event) { event.preventDefault(); event.stopPropagation(); }
+                        resumed = resumePendingJobsForGroup(groupKeyCopy);
+                        setStatus(resumed > 0 ? ("Resumed " + resumed + " queued item(s).") : "Resume canceled or no resumable items.", false);
+                    };
+                }(groupToRender.key)));
+                builtActionsWrap.appendChild(builtResumePendingBtn);
+            }
+
+            if (groupToRender.hasClearableJobs) {
                 builtClearPendingBtn = document.createElement("button");
                 builtClearPendingBtn.type = "button";
                 builtClearPendingBtn.className = "flow-clear-pending-btn is-danger";
-                builtClearPendingBtn.textContent = "Clear";
-                builtClearPendingBtn.title = "Remove pending placeholders in this batch";
+                builtClearPendingBtn.textContent = groupToRender.hasUnsentPendingJobs ? "Cancel queued job(s)" : "Clear";
+                builtClearPendingBtn.title = groupToRender.hasUnsentPendingJobs ? "Cancel only requests Google has not accepted" : "Remove terminal placeholders in this batch";
                 builtClearPendingBtn.addEventListener("click", (function (groupKeyCopy) {
                     return function (event) {
-                        var removed;
+                        var result;
                         if (event && typeof event.preventDefault === "function") {
                             event.preventDefault();
                         }
                         if (event && typeof event.stopPropagation === "function") {
                             event.stopPropagation();
                         }
-                        removed = clearPendingJobsForGroup(groupKeyCopy);
-                        if (removed > 0) {
-                            setStatus("Removed " + removed + " pending item(s) from batch.", false);
+                        result = clearPendingJobsForGroup(groupKeyCopy);
+                        if (result.removed > 0) {
+                            setStatus("Removed " + result.removed + " safe item(s)." + (result.protected ? " Kept " + result.protected + " accepted/active operation(s)." : ""), false);
                             return;
                         }
-                        setStatus("No pending placeholders to clear.", false);
+                        setStatus(result.protected ? "Accepted or active Google operations were kept." : "No safe placeholders to clear.", false);
                     };
                 }(groupToRender.key)));
                 builtActionsWrap.appendChild(builtClearPendingBtn);
+            }
+
+            if ((groupToRender.hasTrackedOperation || groupToRender.hasNeedsReviewJobs) && groupToRender.activePendingJobsCount === 0) {
+                builtStopTrackingBtn = document.createElement("button");
+                builtStopTrackingBtn.type = "button";
+                builtStopTrackingBtn.className = "flow-clear-pending-btn is-danger";
+                builtStopTrackingBtn.textContent = "Stop tracking";
+                builtStopTrackingBtn.title = groupToRender.hasNeedsReviewJobs ? "Forget this uncertain submission review record" : "Forget the Google operation without cancelling it";
+                builtStopTrackingBtn.addEventListener("click", (function (groupKeyCopy) {
+                    return function (event) {
+                        var stopped;
+                        if (event) { event.preventDefault(); event.stopPropagation(); }
+                        stopped = stopTrackingOperationsForGroup(groupKeyCopy);
+                        setStatus(stopped > 0 ? ("Stopped tracking " + stopped + " operation(s).") : "Stop tracking canceled.", false);
+                    };
+                }(groupToRender.key)));
+                builtActionsWrap.appendChild(builtStopTrackingBtn);
             }
             builtMetaHead.appendChild(builtActionsWrap);
             builtMetaWrap.appendChild(builtMetaHead);
@@ -5383,6 +5905,18 @@
                 appendMetaChip(builtSubLine, groupToRender.imageSize, "chip-size");
             }
             appendMetaChip(builtSubLine, "x" + String(builtBatchCount), "chip-samples");
+            if (groupToRender.requestTransport) {
+                appendMetaChip(builtSubLine, "transport: " + groupToRender.requestTransport, "chip-transport");
+            }
+            if (groupToRender.errorStatusCode) {
+                appendMetaChip(builtSubLine, "HTTP " + String(groupToRender.errorStatusCode), "chip-error");
+            }
+            if (groupToRender.attemptCount) {
+                appendMetaChip(builtSubLine, "attempts: " + String(groupToRender.attemptCount), "chip-attempts");
+            }
+            if (groupToRender.operationName) {
+                appendMetaChip(builtSubLine, "op: " + truncateText(groupToRender.operationName, 24), "chip-operation", groupToRender.operationName);
+            }
             builtMetaWrap.appendChild(builtSubLine);
 
             builtMetaThumbs = document.createElement("div");
@@ -5395,7 +5929,7 @@
                 builtMetaThumb = document.createElement("img");
                 builtMetaThumb.className = "flow-meta-thumb";
                 builtMetaThumb.alt = "Media thumb";
-                builtMetaThumb.src = toFileUrl(builtMiniThumbPath);
+                builtMetaThumb.setAttribute("data-media-src", toFileUrl(builtMiniThumbPath));
                 builtMetaThumbs.appendChild(builtMetaThumb);
             }
             if (builtMetaThumbs.childNodes.length > 0) {
@@ -5412,6 +5946,7 @@
                 builtErrorLine = document.createElement("div");
                 builtErrorLine.className = "flow-row-error";
                 builtErrorLine.textContent = truncateText(groupToRender.error, 180);
+                builtErrorLine.title = groupToRender.errorDetails || groupToRender.error;
                 builtMetaWrap.appendChild(builtErrorLine);
             }
 
@@ -5453,6 +5988,16 @@
                 group.referencePaths.join(","),
                 String(group.pendingJobsCount || 0),
                 String(group.activePendingJobsCount || 0),
+                group.hasManualResumeJobs ? "resume" : "",
+                group.hasNeedsReviewJobs ? "review" : "",
+                group.hasUnsentPendingJobs ? "unsent" : "",
+                group.hasTrackedOperation ? "tracked" : "",
+                group.hasClearableJobs ? "clearable" : "",
+                group.errorDetails || "",
+                group.errorStatusCode || "",
+                group.requestTransport || "",
+                group.operationName || "",
+                group.attemptCount || 0,
                 group.items.length
             ].join("|"));
             for (j = 0; j < group.items.length; j += 1) {
@@ -5471,7 +6016,11 @@
                 currentItem.previewPath || "",
                 currentItem.importedToProject ? "1" : "0",
                 currentItem.projectImportPath || "",
-                currentItem.error || ""
+                currentItem.error || "",
+                currentItem.operationName || "",
+                currentItem.requestTransport || "",
+                currentItem.errorStatusCode || "",
+                currentItem.attemptCount || 0
             ].join("|"));
         }
             groupRenderKeys[group.key] = renderKeyParts.slice(renderKeyParts.length - (group.items.length + 1)).join("||");
@@ -5552,6 +6101,36 @@
 
         for (i = 0; i < desiredRows.length; i += 1) {
             list.appendChild(desiredRows[i]);
+        }
+        if (totalGroupCount > groups.length) {
+            row = document.createElement("div");
+            row.className = "muted-note gallery-load-more";
+            row.textContent = "Loading older media...";
+            list.appendChild(row);
+            if (typeof window.IntersectionObserver === "function") {
+                if (galleryLoadMoreObserver) { galleryLoadMoreObserver.disconnect(); }
+                galleryLoadMoreObserver = new window.IntersectionObserver(function (entries) {
+                    if (entries[0] && entries[0].isIntersecting) {
+                        galleryLoadMoreObserver.disconnect();
+                        galleryGroupRenderLimit += GALLERY_GROUP_RENDER_STEP;
+                        lastVideosListRenderKey = null;
+                        renderVideosList(getState());
+                    }
+                }, { root: null, rootMargin: "500px 0px" });
+                galleryLoadMoreObserver.observe(row);
+            } else {
+                row.textContent = "Show older media";
+                row.setAttribute("role", "button");
+                row.setAttribute("tabindex", "0");
+                row.addEventListener("click", function () {
+                    galleryGroupRenderLimit += GALLERY_GROUP_RENDER_STEP;
+                    lastVideosListRenderKey = null;
+                    renderVideosList(getState());
+                });
+            }
+        }
+        if (getRenderAdapter() && typeof getRenderAdapter().observeLazyMedia === "function") {
+            getRenderAdapter().observeLazyMedia(list);
         }
     }
 
@@ -6072,6 +6651,7 @@
         var btnCapture = getById("btnMediaPreviewCapture");
         var btnToFrames = getById("btnMediaPreviewToFrames");
         var btnReveal = getById("btnMediaPreviewReveal");
+        var btnExtend = getById("btnMediaPreviewExtend");
         var btnDelete = getById("btnMediaPreviewDelete");
         var record = null;
         var filePath = "";
@@ -6118,6 +6698,10 @@
         }
         if (btnReveal) {
             btnReveal.hidden = false;
+        }
+        if (btnExtend) {
+            btnExtend.hidden = mediaPreviewKind !== "video" || !record ||
+                (record.model !== MODEL_VEO_31 && record.model !== MODEL_VEO_31_FAST);
         }
         if (btnDelete) {
             btnDelete.hidden = false;
@@ -6304,6 +6888,13 @@
             lines.push("Resolution: " + selectedVideo.resolution);
         }
         lines.push("Request: " + (selectedVideo.requestMode || "frames"));
+        if (selectedVideo.requestTransport) { lines.push("Media transport: " + selectedVideo.requestTransport); }
+        if (selectedVideo.referencePlacement) { lines.push("Reference placement: " + selectedVideo.referencePlacement); }
+        if (selectedVideo.fallbackReason) { lines.push("Compatibility fallback: " + selectedVideo.fallbackReason); }
+        if (typeof selectedVideo.seed === "number") { lines.push("Seed: " + selectedVideo.seed); }
+        if (selectedVideo.sourceVideoPath) { lines.push("Extended from: " + selectedVideo.sourceVideoPath); }
+        if (selectedVideo.operationName) { lines.push("Operation: " + selectedVideo.operationName); }
+        if (selectedVideo.attemptCount) { lines.push("Submission attempts: " + selectedVideo.attemptCount); }
         if (selectedVideo.refIds && selectedVideo.refIds.length) {
             lines.push("Refs: " + selectedVideo.refIds.length);
         }
@@ -6549,7 +7140,7 @@
         var imageModelSelect = getById("imageModelSelect");
         var mode = normalizeVideoMode(getVideoGenSettings(state).mode);
         var videoModeLabel = "Frames";
-        var videoSampleText = "x2";
+        var videoSampleText = "x1";
         var imageSampleText = "x1";
         var videoAspectText = "16:9";
         var videoDurationText = "8s";
@@ -6682,26 +7273,65 @@
     }
 
     function renderAll(state) {
+        var shotsKey;
+        var refsKey;
+        var videoPreviewKey;
+        var imagePreviewKey;
+        var mediaOverlayKey;
+        var settingsKey;
         try {
             hideHoverTooltip();
             if (ensureStateSelections(state)) {
                 return;
             }
-            renderShotsList(state);
-            renderImageShotsList(state);
-            renderVideosList(state);
-            renderStartEndSummary(state);
-            renderVideoRefsList(state);
-            renderVideoPreview(state);
 
-            renderRefsList(state);
+            shotsKey = JSON.stringify([state.shots || [], state.selectedShotId || "", state.startShotId || "", state.endShotId || ""]);
+            if (shotsKey !== lastShotsRenderKey) {
+                renderShotsList(state);
+                renderImageShotsList(state);
+                renderStartEndSummary(state);
+                lastShotsRenderKey = shotsKey;
+            }
+
+            renderVideosList(state);
             renderImagesList(state);
-            renderImagePreview(state);
-            renderMediaPreviewOverlay(state);
-            syncVideoSettingsControls(state);
-            syncImageSettingsControls(state);
-            renderVideoModeUi(state);
-            renderFlowComposerSummary(state);
+
+            refsKey = JSON.stringify([state.refs || [], state.videoRefs || []]);
+            if (refsKey !== lastRefsRenderKey) {
+                renderVideoRefsList(state);
+                renderRefsList(state);
+                lastRefsRenderKey = refsKey;
+            }
+
+            videoPreviewKey = JSON.stringify([state.selectedVideoId || "", state.videos || [], state.shots || []]);
+            if (videoPreviewKey !== lastVideoPreviewRenderKey) {
+                renderVideoPreview(state);
+                lastVideoPreviewRenderKey = videoPreviewKey;
+            }
+
+            imagePreviewKey = JSON.stringify([state.selectedImageId || "", state.images || []]);
+            if (imagePreviewKey !== lastImagePreviewRenderKey) {
+                renderImagePreview(state);
+                lastImagePreviewRenderKey = imagePreviewKey;
+            }
+
+            mediaOverlayKey = JSON.stringify([mediaPreviewKind, mediaPreviewId, state.videos || [], state.images || []]);
+            if (mediaOverlayKey !== lastMediaOverlayRenderKey) {
+                renderMediaPreviewOverlay(state);
+                lastMediaOverlayRenderKey = mediaOverlayKey;
+            }
+
+            settingsKey = JSON.stringify([
+                state.videoGenSettings || {}, state.imageGenSettings || {}, state.startShotId || "", state.endShotId || "",
+                state.videoRefs || [], activeGenerationType, videoCapabilities.checked, videoCapabilities.inlineData
+            ]);
+            if (settingsKey !== lastSettingsRenderKey) {
+                syncVideoSettingsControls(state);
+                syncImageSettingsControls(state);
+                renderVideoModeUi(state);
+                renderFlowComposerSummary(state);
+                lastSettingsRenderKey = settingsKey;
+            }
             updateCarouselDensity();
         } catch (error) {
             setStatus("Render failed: " + formatError(error), true);
@@ -6720,6 +7350,17 @@
     }
 
     function refreshBusyUi() {
+        var pauseButton = getById("btnCancelVideo");
+        var pending = getPendingJobs(getState());
+        var hasPaused = false;
+        var pauseIndex;
+        for (pauseIndex = 0; pauseIndex < pending.length; pauseIndex += 1) {
+            if (pending[pauseIndex] && pending[pauseIndex].kind === "video" && pending[pauseIndex].status === "paused") { hasPaused = true; break; }
+        }
+        if (pauseButton) {
+            pauseButton.hidden = !(isVideoGenerating || isResumingPendingJobs || hasPaused);
+            pauseButton.textContent = isVideoGenerating || isResumingPendingJobs ? "Pause" : "Resume";
+        }
         // Keep composer controls interactive so users can queue next requests immediately.
         setControlsEnabled([
             "btnGenerate",
@@ -6785,12 +7426,15 @@
         var aspectRatioSelect = getById("aspectRatioSelect");
         var durationSecondsSelect = getById("durationSecondsSelect");
         var resolutionSelect = getById("resolutionSelect");
+        var seedInput = getById("seedInput");
         var prompt = trimText(promptInput ? promptInput.value : "");
-        var sampleCount = parseSampleCount(sampleSelect ? sampleSelect.value : "2");
+        var sampleCount = parseSampleCount(sampleSelect ? sampleSelect.value : "1");
         var modelId = trimText(modelSelect ? modelSelect.value : videoSettings.model);
         var aspectRatio = normalizeAspectRatio(aspectRatioSelect ? aspectRatioSelect.value : videoSettings.aspectRatio);
         var durationSeconds = parseInt(durationSecondsSelect ? durationSecondsSelect.value : videoSettings.durationSeconds, 10) || 8;
         var resolution = String(resolutionSelect ? resolutionSelect.value : videoSettings.resolution || "720p").toLowerCase();
+        var seedText = trimText(seedInput ? seedInput.value : (videoSettings.seed === null ? "" : String(videoSettings.seed)));
+        var seed = seedText === "" ? null : Number(seedText);
         var apiKey = getApiKeyFromStorage();
         var i;
         var refIds = [];
@@ -6808,6 +7452,9 @@
         }
         if (!prompt) {
             throw new Error("Prompt is empty.");
+        }
+        if (seed !== null && (!isFinite(seed) || Math.floor(seed) !== seed)) {
+            throw new Error("Seed must be an integer or left empty.");
         }
 
         constraints = getVideoGenerationConstraints({
@@ -6888,6 +7535,7 @@
             mode: mode,
             durationSeconds: durationSeconds,
             resolution: resolution,
+            seed: seed,
             videosDir: resolveLibraryVideosDir(),
             startShot: startShot,
             endShot: endShot,
@@ -6904,7 +7552,7 @@
         var aspectSelect = getById("imageAspectRatioSelect");
         var sizeSelect = getById("imageSizeSelect");
         var prompt = trimText(promptInput ? promptInput.value : "");
-        var modelId = trimText(modelSelect ? modelSelect.value : "") || (window.VeoApi ? window.VeoApi.DEFAULT_IMAGE_MODEL_ID : "gemini-3.1-flash-image-preview");
+        var modelId = trimText(modelSelect ? modelSelect.value : "") || (window.VeoApi ? window.VeoApi.DEFAULT_IMAGE_MODEL_ID : "gemini-3.1-flash-image");
         var aspectRatio = normalizeImageAspectRatio(aspectSelect ? aspectSelect.value : "1:1");
         var imageSize = normalizeImageSize(sizeSelect ? sizeSelect.value : "1K");
         var apiKey = getApiKeyFromStorage();
@@ -6964,6 +7612,15 @@
             resolution: context.resolution || null,
             refIds: context.referenceIds || [],
             requestMode: result.requestMode || "frames",
+            requestTransport: result.requestTransport || null,
+            referencePlacement: result.referencePlacement || null,
+            fallbackReason: result.fallbackReason || null,
+            seed: typeof context.seed === "number" ? context.seed : null,
+            sourceVideoId: context.sourceVideoId || null,
+            sourceVideoPath: context.sourceVideoPath || null,
+            operationName: result.operationName || null,
+            operationUrl: result.operationUrl || null,
+            attemptCount: result && typeof result.attemptCount === "number" ? result.attemptCount : (context.attemptCount || 0),
             batchId: context.batchId || null,
             sampleIndex: context.sampleIndex || null,
             sampleCount: context.sampleCount || null,
@@ -7095,6 +7752,9 @@
     }
 
     function resolveApiModeForInput(input) {
+        if (input.mode === "extend") {
+            return "extend";
+        }
         if (input.mode === VIDEO_MODE_FRAMES) {
             if (input.startShot && input.startShot.path && input.endShot && input.endShot.path) {
                 return "interpolation";
@@ -7159,6 +7819,9 @@
                 apiMode: apiMode,
                 durationSeconds: input.durationSeconds || 8,
                 resolution: input.resolution || "720p",
+                seed: typeof input.seed === "number" ? input.seed : null,
+                sourceVideoId: input.sourceVideoId || null,
+                sourceVideoPath: input.sourceVideoPath || null,
                 videosDir: input.videosDir || "",
                 startShotId: input.startShot && input.startShot.id ? input.startShot.id : null,
                 endShotId: input.endShot && input.endShot.id ? input.endShot.id : null,
@@ -7169,7 +7832,13 @@
                 startShotFrame: input.startShot && typeof input.startShot.frame === "number" ? input.startShot.frame : null,
                 endShotFrame: input.endShot && typeof input.endShot.frame === "number" ? input.endShot.frame : null,
                 references: refsSnapshot,
-                referenceIds: refIds
+                referenceIds: refIds,
+                createdByRunner: pendingJobsRunnerId,
+                buildId: RUNTIME_BUILD_ID,
+                lastProgressAt: nowIso,
+                resumeRequired: false,
+                claimedBy: null,
+                claimExpiresAt: null
             });
         }
 
@@ -7290,17 +7959,22 @@
             aspectRatio: normalizeAspectRatio(job.aspectRatio || "16:9"),
             durationSeconds: job.durationSeconds || 8,
             resolution: job.resolution || "720p",
+            seed: typeof job.seed === "number" ? job.seed : null,
+            sourceVideoPath: job.sourceVideoPath || "",
             sampleIndex: job.sampleIndex || 1,
             sampleCount: job.sampleCount || 1,
             referenceImages: cloneReferenceEntriesForJob(job.references || []),
             videosDir: job.videosDir || "",
-            allowTextOnlyFallback: false
+            allowTextOnlyFallback: false,
+            attemptCount: job.attemptCount || 0
         };
 
         if (job.operationName || job.operationUrl) {
             payload.resumeOperationName = job.operationName || "";
             payload.resumeOperationUrl = job.operationUrl || "";
             payload.requestMode = job.requestMode || "";
+            payload.requestTransport = job.requestTransport || "";
+            payload.referencePlacement = job.referencePlacement || "";
             payload.fallbackReason = job.fallbackReason || "";
         }
         return payload;
@@ -7336,10 +8010,14 @@
             mode: job.uiMode || VIDEO_MODE_FRAMES,
             durationSeconds: job.durationSeconds || 8,
             resolution: job.resolution || "720p",
+            seed: typeof job.seed === "number" ? job.seed : null,
+            sourceVideoId: job.sourceVideoId || null,
+            sourceVideoPath: job.sourceVideoPath || null,
             referenceIds: job.referenceIds && job.referenceIds instanceof Array ? job.referenceIds.slice(0) : [],
             batchId: job.batchId || null,
             sampleIndex: job.sampleIndex || null,
-            sampleCount: job.sampleCount || null
+            sampleCount: job.sampleCount || null,
+            attemptCount: job.attemptCount || 0
         };
     }
 
@@ -7373,105 +8051,131 @@
 
     function runPendingVideoJobs(options) {
         var runOptions = options || {};
-        var targetIds = runOptions.jobIds && runOptions.jobIds instanceof Array ? runOptions.jobIds.slice(0) : null;
-        var stopOnError = runOptions.stopOnError !== false;
-        var requestedConcurrency = parseInt(runOptions.concurrency, 10);
-        var jobs = getPendingVideoJobsForExecution(targetIds);
-        var trackedJobIds = {};
-        var total = jobs.length;
+        var allowQueued = runOptions.allowQueued !== false;
+        var apiKey = getApiKeyFromStorage();
         var done = 0;
         var failed = 0;
-        var firstError = null;
-        var apiKey = getApiKeyFromStorage();
-        var nextIndex = 0;
-        var activeCount = 0;
-        var completedCount = 0;
-        var isAborting = false;
-        var concurrency = requestedConcurrency;
-        var launchTimer = null;
-        var isLaunching = false;
-        var i;
+        var total = 0;
+        var stopWorker = false;
+        var queue = getQueueAdapter();
+        cancelVideoRunRequested = false;
 
-        function registerTrackedJobs(items) {
-            var idx;
-            var candidate;
-            for (idx = 0; idx < items.length; idx += 1) {
-                candidate = items[idx];
-                if (candidate && candidate.id) {
-                    trackedJobIds[candidate.id] = true;
+        function isCandidate(job) {
+            var status = normalizeVideoJobStatus(job && job.status);
+            var hasOperation = !!(job && (job.operationName || job.operationUrl));
+            if (!job || job.kind !== "video") { return false; }
+            if (status === "queued") { return allowQueued; }
+            return hasOperation && (status === "polling" || status === "downloading" || status === "importing");
+        }
+
+        function findNextJob() {
+            var jobs = sortJobsForExecution(getPendingJobs(loadFreshState()).filter(function (job) {
+                var claimExpiresAt = parseInt(job && job.claimExpiresAt, 10) || 0;
+                if (!isCandidate(job)) { return false; }
+                return !job.claimedBy || job.claimedBy === pendingJobsRunnerId || claimExpiresAt <= new Date().getTime();
+            }));
+            return jobs.length ? jobs[0] : null;
+        }
+
+        function touchProgress(jobId, patch) {
+            var now = new Date();
+            var nextPatch = cloneJson(patch || {}, {});
+            var releaseClaim = !!nextPatch.releaseClaim;
+            var adapter = getStateAdapter();
+            var updated = false;
+            var nextLease;
+            if (nextPatch.hasOwnProperty("releaseClaim")) { delete nextPatch.releaseClaim; }
+            pendingJobsLastProgressAtMs = now.getTime();
+            nextPatch.claimedBy = releaseClaim ? null : pendingJobsRunnerId;
+            nextPatch.claimExpiresAt = releaseClaim ? null : pendingJobsLastProgressAtMs + PENDING_JOBS_LEASE_TTL_MS;
+            nextPatch.buildId = RUNTIME_BUILD_ID;
+            nextPatch.lastProgressAt = now.toISOString();
+            nextLease = {
+                ownerId: pendingJobsRunnerId,
+                runId: pendingJobsRunId,
+                buildId: RUNTIME_BUILD_ID,
+                activeJobId: pendingJobsCurrentJobId,
+                lastProgressAt: nextPatch.lastProgressAt,
+                expiresAt: pendingJobsLastProgressAtMs + PENDING_JOBS_LEASE_TTL_MS,
+                updatedAt: nextPatch.lastProgressAt
+            };
+
+            if (adapter && typeof adapter.updateStateWith === "function") {
+                adapter.updateStateWith(function (latestState) {
+                    var lease = getPendingJobsLease(latestState);
+                    var jobs;
+                    var nextJobs;
+                    var i;
+                    var key;
+                    if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                        return {};
+                    }
+                    jobs = getPendingJobs(latestState);
+                    nextJobs = jobs.slice(0);
+                    for (i = 0; i < nextJobs.length; i += 1) {
+                        if (!nextJobs[i] || nextJobs[i].id !== jobId) { continue; }
+                        nextJobs[i] = cloneJson(nextJobs[i], {});
+                        for (key in nextPatch) {
+                            if (nextPatch.hasOwnProperty(key)) { nextJobs[i][key] = nextPatch[key]; }
+                        }
+                        nextJobs[i].updatedAt = nextPatch.lastProgressAt;
+                        updated = true;
+                        break;
+                    }
+                    if (!updated) { return {}; }
+                    return { pendingJobs: trimPendingJobs(nextJobs), pendingJobsLease: nextLease };
+                });
+                return updated;
+            }
+
+            patchPendingJob(jobId, nextPatch);
+            refreshPendingJobsLease();
+            return true;
+        }
+
+        function claimJob(job) {
+            var verified;
+            pendingJobsCurrentJobId = job.id;
+            touchProgress(job.id, {});
+            verified = findPendingJobById(loadFreshState(), job.id);
+            return verified && verified.claimedBy === pendingJobsRunnerId ? verified : null;
+        }
+
+        function pauseUnsentJobs(status, reason) {
+            mutatePendingJobs(function (jobs) {
+                var next = jobs.slice(0);
+                var i;
+                for (i = 0; i < next.length; i += 1) {
+                    if (!next[i] || next[i].kind !== "video" || normalizeVideoJobStatus(next[i].status) !== "queued" || next[i].operationName || next[i].operationUrl) {
+                        continue;
+                    }
+                    next[i].status = status;
+                    next[i].resumeRequired = true;
+                    next[i].recoveryReason = reason;
+                    next[i].claimedBy = null;
+                    next[i].claimExpiresAt = null;
+                    next[i].updatedAt = (new Date()).toISOString();
                 }
-            }
+                return next;
+            });
         }
-
-        function injectQueuedJobs() {
-            var injectedIds = drainInjectedVideoJobIds();
-            var injectedJobs;
-            var added = 0;
-            var idx;
-            var candidate;
-            if (!injectedIds.length) {
-                return 0;
-            }
-            injectedJobs = getPendingVideoJobsForExecution(injectedIds);
-            for (idx = 0; idx < injectedJobs.length; idx += 1) {
-                candidate = injectedJobs[idx];
-                if (!candidate || !candidate.id || trackedJobIds[candidate.id]) {
-                    continue;
-                }
-                trackedJobIds[candidate.id] = true;
-                jobs.push(candidate);
-                total += 1;
-                added += 1;
-            }
-            if (added > 0) {
-                jobs = sortJobsForExecution(jobs);
-            }
-            return added;
-        }
-
-        if (!isFinite(concurrency) || concurrency < 1) {
-            concurrency = Math.min(4, total || 1);
-        }
-        if (concurrency > 4) {
-            concurrency = 4;
-        }
-        registerTrackedJobs(jobs);
 
         function setJobProgress(job, stage, details, isError) {
             var info = details || {};
-            var jobProgress = normalizeProgressPercent(info.progressPercent);
-            var fallbackProgress = stageToProgressPercent(stage);
-            var progressText = "";
-            var label = "Sample " + (job.sampleIndex || 1) + "/" + (job.sampleCount || total);
-            var suffix = " (" + done + "/" + total + " done";
-
-            if (jobProgress === null && fallbackProgress !== null) {
-                jobProgress = fallbackProgress;
-            }
-            if (jobProgress !== null) {
-                progressText = " " + String(jobProgress) + "%";
-            }
-
-            if (failed > 0) {
-                suffix += ", " + failed + " failed";
-            }
-            suffix += ")";
-
-            setGenerationStatus(label + ": " + stage + progressText + "..." + suffix, !!isError);
-            setStatus(label + ": " + stage + progressText + "..." + suffix, !!isError);
+            var progress = normalizeProgressPercent(info.progressPercent);
+            if (progress === null) { progress = stageToProgressPercent(stage); }
+            setGenerationStatus("Sample " + (job.sampleIndex || 1) + "/" + (job.sampleCount || 1) + ": " + stage + (progress === null ? "" : " " + progress + "%") + "...", !!isError);
+            setStatus("Video queue: " + done + " done, " + failed + " failed. " + stage + ".", !!isError);
         }
 
         function runOne(job) {
             var payload = buildGeneratePayloadFromVideoJob(job, apiKey);
             var context = buildVideoContextFromJob(job);
-            var statusFromStage;
+            if (!payload.prompt) { return Promise.reject(new Error("Prompt is empty.")); }
 
-            if (!payload.prompt) {
-                return Promise.reject(new Error("Prompt is empty."));
-            }
-
-            patchPendingJob(job.id, {
+            touchProgress(job.id, {
                 status: payload.resumeOperationName || payload.resumeOperationUrl ? "polling" : "uploading",
+                resumeRequired: false,
                 error: null,
                 progressPercent: payload.resumeOperationName || payload.resumeOperationUrl ? 36 : 8,
                 lastStage: payload.resumeOperationName || payload.resumeOperationUrl ? "Polling" : "Uploading"
@@ -7479,210 +8183,181 @@
 
             payload.onStatus = function (stage, details) {
                 var info = details || {};
-                var progressFromDetails = normalizeProgressPercent(info.progressPercent);
-                var progressForPatch = progressFromDetails;
-                statusFromStage = mapVideoStageToJobStatus(stage);
-                if (progressForPatch === null) {
-                    progressForPatch = stageToProgressPercent(stage);
+                var progress = normalizeProgressPercent(info.progressPercent);
+                var latestJob = findPendingJobById(getState(), job.id);
+                var nextStatus = mapVideoStageToJobStatus(stage);
+                if (progress === null) { progress = stageToProgressPercent(stage); }
+                if (trimText(stage).toLowerCase().indexOf("retry") === 0 && latestJob && (latestJob.operationName || latestJob.operationUrl) && nextStatus === "uploading") {
+                    nextStatus = "polling";
                 }
-                patchPendingJob(job.id, {
-                    status: statusFromStage,
-                    progressPercent: progressForPatch,
-                    lastStage: stage || null
+                touchProgress(job.id, {
+                    status: nextStatus,
+                    progressPercent: progress,
+                    lastStage: stage || null,
+                    attemptCount: typeof info.attemptCount === "number" ? info.attemptCount : (job.attemptCount || 0),
+                    retryAfterMs: typeof info.retryDelayMs === "number" ? info.retryDelayMs : null,
+                    lastErrorAt: stage === "Retrying" ? (new Date()).toISOString() : (job.lastErrorAt || null)
                 });
                 setJobProgress(job, stage || "Working", info, false);
             };
-
+            payload.shouldCancel = function () { return cancelVideoRunRequested; };
             payload.onOperation = function (operationInfo) {
-                patchPendingJob(job.id, {
+                touchProgress(job.id, {
                     status: "polling",
                     progressPercent: 40,
                     operationName: operationInfo && operationInfo.operationName ? operationInfo.operationName : null,
                     operationUrl: operationInfo && operationInfo.operationUrl ? operationInfo.operationUrl : null,
                     requestMode: operationInfo && operationInfo.requestMode ? operationInfo.requestMode : (job.requestMode || null),
+                    requestTransport: operationInfo && operationInfo.requestTransport ? operationInfo.requestTransport : (job.requestTransport || null),
+                    referencePlacement: operationInfo && operationInfo.referencePlacement ? operationInfo.referencePlacement : (job.referencePlacement || null),
                     fallbackReason: operationInfo && operationInfo.fallbackReason ? operationInfo.fallbackReason : (job.fallbackReason || null),
+                    attemptCount: operationInfo && typeof operationInfo.attemptCount === "number" ? operationInfo.attemptCount : (job.attemptCount || 0),
                     lastStage: "Polling"
                 });
             };
 
             return window.VeoApi.generateVideo(payload).then(function (result) {
-                patchPendingJob(job.id, {
+                touchProgress(job.id, {
                     status: "importing",
                     progressPercent: 96,
                     downloadedPath: result && result.downloadedPath ? result.downloadedPath : null,
                     operationName: result && result.operationName ? result.operationName : (job.operationName || null),
                     operationUrl: result && result.operationUrl ? result.operationUrl : (job.operationUrl || null),
                     requestMode: result && result.requestMode ? result.requestMode : (job.requestMode || null),
+                    requestTransport: result && result.requestTransport ? result.requestTransport : (job.requestTransport || null),
+                    referencePlacement: result && result.referencePlacement ? result.referencePlacement : (job.referencePlacement || null),
                     fallbackReason: result && result.fallbackReason ? result.fallbackReason : (job.fallbackReason || null),
                     lastStage: "Importing"
                 });
-
                 finalizeGeneratedVideoJob(job.id, result, context);
-                if (result.requestMode === "text_only_fallback") {
-                    setGenerationStatus("Sample " + (job.sampleIndex || 1) + "/" + (job.sampleCount || total) + ": Done (text-only fallback) (" + (done + 1) + "/" + total + ")", false);
-                } else {
-                    setGenerationStatus("Sample " + (job.sampleIndex || 1) + "/" + (job.sampleCount || total) + ": Done (" + (done + 1) + "/" + total + ")", false);
-                }
                 setStatus("Done: " + baseName(result.downloadedPath), false);
             }, function (error) {
                 var message = toCardErrorMessage(error);
-                patchPendingJob(job.id, {
-                    status: "failed",
-                    error: message,
+                var failureStatus = queue && typeof queue.classifyFailure === "function" ? queue.classifyFailure(error) : (error && error.cancelled ? "paused" : "failed");
+                var isQuota = failureStatus === "quota_paused";
+                var isUncertain = failureStatus === "needs_review";
+                var isManualRetry = failureStatus === "waiting_resume";
+                touchProgress(job.id, {
+                    status: failureStatus,
+                    resumeRequired: failureStatus === "paused" || isQuota || isUncertain || isManualRetry,
+                    recoveryReason: isUncertain ? "Google may have accepted this request. Automatic resubmission is disabled." : (isQuota ? "Quota must be available before Resume." : (isManualRetry ? "Google rejected the request with a temporary rate limit. Press Resume to try again." : null)),
+                    error: error && error.cancelled ? null : message,
+                    errorCode: error && error.code ? error.code : null,
+                    errorStatusCode: error && error.statusCode ? error.statusCode : null,
+                    errorDetails: error && error.details ? error.details : null,
+                    errorPayload: error && error.errorPayload ? cloneJson(error.errorPayload, null) : null,
+                    originalErrorMessage: error && error.originalMessage ? String(error.originalMessage) : null,
+                    requestTransport: error && error.requestTransport ? error.requestTransport : (job.requestTransport || null),
+                    referencePlacement: error && error.referencePlacement ? error.referencePlacement : (job.referencePlacement || null),
+                    retryAfterMs: error && typeof error.retryAfterMs === "number" ? error.retryAfterMs : null,
+                    quotaReason: error && error.quotaReason ? error.quotaReason : null,
+                    attemptCount: error && typeof error.attemptCount === "number" ? error.attemptCount : (job.attemptCount || 0),
+                    lastErrorAt: (new Date()).toISOString(),
                     progressPercent: 0,
-                    lastStage: "Failed"
+                    lastStage: failureStatus === "paused" ? "Paused" : (isQuota ? "Quota paused" : (isUncertain ? "Needs review" : (isManualRetry ? "Waiting for Resume" : "Failed"))),
+                    releaseClaim: true
                 });
-                throw new Error("Sample " + (job.sampleIndex || 1) + "/" + (job.sampleCount || total) + ": " + message);
+                if (isQuota || isUncertain || isManualRetry) {
+                    stopWorker = true;
+                    pauseUnsentJobs(isQuota ? "quota_paused" : "waiting_resume", isQuota ? "Queue paused because Google reported exhausted quota." : (isUncertain ? "Queue paused after an uncertain submission." : "Queue paused after a temporary Google rate limit."));
+                } else if (failureStatus === "paused") {
+                    stopWorker = true;
+                    pauseUnsentJobs("waiting_resume", "Queue was paused by the user. Press Resume to continue.");
+                }
+                throw error;
             });
         }
 
-        function finishAndReset(resolve, reject) {
+        function finish() {
             isVideoGenerating = false;
             isResumingPendingJobs = false;
             stopPendingJobsLeaseHeartbeat();
             releasePendingJobsLease();
-            if (launchTimer && typeof window.clearInterval === "function") {
-                window.clearInterval(launchTimer);
-                launchTimer = null;
-            }
+            pendingJobsCurrentJobId = null;
+            pendingJobsRunId = null;
+            pendingJobsLastProgressAtMs = 0;
             refreshBusyUi();
-            if (hasActivePendingVideoJobs(getState())) {
-                schedulePendingVideoResume(120);
-            }
             if (failed > 0) {
-                setGenerationStatus("Completed with errors (" + done + "/" + total + " done, " + failed + " failed).", true);
-                setStatus("Video generation completed with errors.", true);
+                setGenerationStatus("Queue stopped (" + done + " done, " + failed + " failed).", true);
+            } else if (done > 0) {
+                setGenerationStatus("Done (" + done + "/" + total + ").", false);
             }
-            resolve({
-                done: done,
-                failed: failed,
-                total: total,
-                hasErrors: failed > 0
+            schedulePendingVideoResume(150, false);
+            return { done: done, failed: failed, total: total, hasErrors: failed > 0 };
+        }
+
+        function runNext() {
+            var candidate;
+            var claimed;
+            if (stopWorker) { return Promise.resolve(); }
+            candidate = findNextJob();
+            if (!candidate) { return Promise.resolve(); }
+            claimed = claimJob(candidate);
+            if (!claimed) { return Promise.resolve().then(runNext); }
+            total += 1;
+            return runOne(claimed).then(function () {
+                done += 1;
+                pendingJobsCurrentJobId = null;
+                return runNext();
+            }, function () {
+                failed += 1;
+                pendingJobsCurrentJobId = null;
+                return runNext();
             });
         }
 
-        if (!total) {
-            return Promise.resolve();
+        if (isVideoGenerating) {
+            return Promise.resolve({ blocked: true, reason: "local_worker_active" });
+        }
+        if (!findNextJob()) {
+            return Promise.resolve({ done: 0, failed: 0, total: 0, hasErrors: false });
         }
         if (!apiKey) {
             return Promise.reject(new Error("API key is missing. Open Settings in the main panel."));
         }
-        if (isVideoGenerating) {
-            return Promise.reject(new Error("Another operation is already running."));
-        }
+        pendingJobsRunId = "run_" + String(new Date().getTime()) + "_" + String(Math.floor(Math.random() * 1000000));
+        pendingJobsLastProgressAtMs = new Date().getTime();
         if (!acquirePendingJobsLease()) {
-            if (runOptions.isResume) {
-                return Promise.resolve();
-            }
-            return Promise.reject(new Error("Pending jobs are already processed in another Gallery window."));
+            var foreignLease = getPendingJobsLease(getState());
+            var retryDelay = queue && typeof queue.leaseRetryDelay === "function" ? queue.leaseRetryDelay(foreignLease) : PENDING_JOBS_LEASE_TTL_MS;
+            pendingJobsRunId = null;
+            setGenerationStatus("Blocked by another Gallery. Queue will retry automatically.", false);
+            schedulePendingVideoResume(retryDelay, allowQueued);
+            return Promise.resolve({ blocked: true, reason: "foreign_lease" });
         }
 
         isVideoGenerating = true;
         isResumingPendingJobs = !!runOptions.isResume;
         startPendingJobsLeaseHeartbeat();
         refreshBusyUi();
-
-        return new Promise(function (resolve, reject) {
-            function maybeFinish() {
-                if (!isAborting) {
-                    injectQueuedJobs();
-                }
-                if (completedCount >= total && activeCount === 0) {
-                    finishAndReset(resolve, reject);
-                }
-            }
-
-            function launchNext() {
-                var job;
-                var runPromise;
-                var nextConcurrency = concurrency;
-
-                if (isLaunching) {
-                    return;
-                }
-                isLaunching = true;
-
-                try {
-                    if (!isAborting) {
-                        injectQueuedJobs();
-                    }
-
-                    if (isAborting && activeCount === 0) {
-                        maybeFinish();
-                        return;
-                    }
-
-                    nextConcurrency = Math.min(4, total || 1);
-                    if (nextConcurrency < 1) {
-                        nextConcurrency = 1;
-                    }
-
-                    while (!isAborting && activeCount < nextConcurrency && nextIndex < total) {
-                        job = jobs[nextIndex];
-                        nextIndex += 1;
-                        activeCount += 1;
-
-                        try {
-                            runPromise = runOne(job);
-                        } catch (syncError) {
-                            activeCount -= 1;
-                            completedCount += 1;
-                            failed += 1;
-                            firstError = firstError || syncError;
-                            if (stopOnError) {
-                                isAborting = true;
-                                markRemainingVideoJobsFailed(targetIds || [], toCardErrorMessage(syncError));
-                            }
-                            continue;
-                        }
-
-                        if (!runPromise || typeof runPromise.then !== "function") {
-                            runPromise = Promise.resolve(runPromise);
-                        }
-
-                        (function (jobRef, promiseRef) {
-                            promiseRef.then(function () {
-                                done += 1;
-                                activeCount -= 1;
-                                completedCount += 1;
-                                if (!isAborting) {
-                                    launchNext();
-                                }
-                                maybeFinish();
-                            }, function (error) {
-                                failed += 1;
-                                activeCount -= 1;
-                                completedCount += 1;
-                                firstError = firstError || error;
-                                if (stopOnError && !isAborting) {
-                                    isAborting = true;
-                                    markRemainingVideoJobsFailed(targetIds || [], toCardErrorMessage(error));
-                                }
-                                if (!isAborting) {
-                                    launchNext();
-                                }
-                                maybeFinish();
-                            });
-                        }(job, runPromise));
-                    }
-
-                    maybeFinish();
-                } finally {
-                    isLaunching = false;
-                }
-            }
-
-            if (typeof window.setInterval === "function") {
-                launchTimer = window.setInterval(function () {
-                    if (isAborting) {
-                        return;
-                    }
-                    launchNext();
-                }, 120);
-            }
-
-            launchNext();
+        return Promise.resolve().then(runNext).then(finish, function (error) {
+            finish();
+            throw error;
         });
+    }
+
+    function toggleVideoGenerationPause() {
+        var state;
+        var jobs;
+        var ids = [];
+        var i;
+        if (isVideoGenerating || isResumingPendingJobs) {
+            cancelVideoRunRequested = true;
+            setStatus("Pausing after the current network step...", false);
+            return;
+        }
+        state = getState();
+        jobs = getPendingJobs(state).slice(0);
+        for (i = 0; i < jobs.length; i += 1) {
+            if (jobs[i] && jobs[i].kind === "video" && jobs[i].status === "paused") {
+                jobs[i].status = "queued";
+                jobs[i].updatedAt = (new Date()).toISOString();
+                ids.push(jobs[i].id);
+            }
+        }
+        if (!ids.length) { return; }
+        stateAdapterUpdate({ pendingJobs: jobs });
+        runPendingVideoJobs({ jobIds: ids, stopOnError: false, concurrency: 1, isResume: true, allowQueued: true });
     }
 
     function hasActivePendingVideoJobs(state) {
@@ -7696,8 +8371,9 @@
         return false;
     }
 
-    function schedulePendingVideoResume(delayMs) {
+    function schedulePendingVideoResume(delayMs, allowQueued) {
         var waitMs = typeof delayMs === "number" && delayMs >= 0 ? delayMs : 300;
+        pendingVideoResumeAllowQueued = pendingVideoResumeAllowQueued || !!allowQueued;
 
         if (pendingVideoResumeTimer && typeof window.clearTimeout === "function") {
             window.clearTimeout(pendingVideoResumeTimer);
@@ -7707,22 +8383,34 @@
             return;
         }
         pendingVideoResumeTimer = window.setTimeout(function () {
+            var shouldAllowQueued = pendingVideoResumeAllowQueued;
+            pendingVideoResumeAllowQueued = false;
             pendingVideoResumeTimer = null;
             if (isVideoGenerating || isResumingPendingJobs) {
                 return;
             }
-            var state = getState();
+            var state = loadFreshState();
             var lease = getPendingJobsLease(state);
             if (isPendingJobsLeaseActive(lease) && !isPendingJobsLeaseOwnedByCurrentWindow(lease)) {
+                var queue = getQueueAdapter();
+                var nextDelay = queue && typeof queue.leaseRetryDelay === "function" ? queue.leaseRetryDelay(lease) : PENDING_JOBS_LEASE_TTL_MS;
+                schedulePendingVideoResume(nextDelay, shouldAllowQueued);
                 return;
             }
-            if (!hasActivePendingVideoJobs(state)) {
+            var hasCandidate = getPendingJobs(state).some(function (job) {
+                var status = normalizeVideoJobStatus(job && job.status);
+                if (!job || job.kind !== "video") { return false; }
+                if (status === "queued") { return shouldAllowQueued; }
+                return !!(job.operationName || job.operationUrl) && (status === "polling" || status === "downloading" || status === "importing");
+            });
+            if (!hasCandidate) {
                 return;
             }
 
             runPendingVideoJobs({
                 stopOnError: false,
-                isResume: true
+                isResume: true,
+                allowQueued: shouldAllowQueued
             }).then(function (result) {
                 if (result && result.hasErrors) {
                     setGenerationStatus("Recovered pending jobs with errors (" + result.done + "/" + result.total + " done, " + result.failed + " failed).", true);
@@ -7950,6 +8638,11 @@
             return;
         }
 
+        if (isVideoSubmitStarting) {
+            setGenerationStatus("Generation request is already being submitted...", false);
+            return;
+        }
+
         if (!window.VeoApi || typeof window.VeoApi.generateVideo !== "function") {
             setGenerationStatus("VeoApi.generateVideo is unavailable.", true);
             return;
@@ -7965,6 +8658,7 @@
 
         apiMode = resolveApiModeForInput(input);
         input.batchId = makeId("video_batch");
+        isVideoSubmitStarting = true;
 
         Promise.resolve()
             .then(function () {
@@ -7990,19 +8684,26 @@
                 }
                 if (isVideoGenerating || isResumingPendingJobs) {
                     queueInjectedVideoJobIds(jobIds);
-                    setGenerationStatus("Queued " + jobs.length + " sample(s). Starting in parallel...", false);
+                    setGenerationStatus("Queued " + jobs.length + " sample(s). Samples run one at a time.", false);
                     setStatus("Queued video batch (" + jobs.length + " sample(s)).", false);
                     return null;
                 }
                 return runPendingVideoJobs({
                     jobIds: jobIds,
                     stopOnError: false,
-                    concurrency: input.sampleCount || 1,
-                    isResume: false
+                    concurrency: 1,
+                    isResume: false,
+                    allowQueued: true
                 });
             })
             .then(function (result) {
+                isVideoSubmitStarting = false;
                 if (!result) {
+                    return;
+                }
+                if (result.blocked) {
+                    setGenerationStatus("Queued. Another Gallery is processing the video queue.", false);
+                    setStatus("Video batch queued safely.", false);
                     return;
                 }
                 if (result && result.hasErrors) {
@@ -8013,6 +8714,7 @@
                 setGenerationStatus("Done.", false);
                 setStatus("Video generation finished.", false);
             }, function (error) {
+                isVideoSubmitStarting = false;
                 setGenerationStatus("Generation failed: " + formatError(error), true);
                 setStatus("Generation failed: " + formatError(error), true);
             });
@@ -8027,6 +8729,11 @@
         var jobIds = [];
         var i;
 
+        if (isImageSubmitStarting) {
+            setImageGenerationStatus("Image request is already being submitted...", false);
+            return;
+        }
+
         if (!window.VeoApi || typeof window.VeoApi.generateImage !== "function") {
             setImageGenerationStatus("VeoApi.generateImage is unavailable.", true);
             return;
@@ -8040,6 +8747,8 @@
             return;
         }
 
+        isImageSubmitStarting = true;
+
         jobs = enqueueImageGenerationJobs(input, sampleCount, batchId);
         for (i = 0; i < jobs.length; i += 1) {
             jobIds.push(jobs[i].id);
@@ -8051,6 +8760,12 @@
             batchId: batchId,
             jobIds: jobIds
         });
+
+        if (typeof window.setTimeout === "function") {
+            window.setTimeout(function () { isImageSubmitStarting = false; }, 0);
+        } else {
+            isImageSubmitStarting = false;
+        }
 
         if (isImageGenerating) {
             setImageGenerationStatus("Queued image batch (" + sampleCount + " sample(s)).", false);
@@ -9991,6 +10706,7 @@
         var aspectRatioSelect = getById("aspectRatioSelect");
         var durationSecondsSelect = getById("durationSecondsSelect");
         var resolutionSelect = getById("resolutionSelect");
+        var seedInput = getById("seedInput");
         var imagePromptInput = getById("imagePromptInput");
         var savedPrompt = "";
         var savedModel = "";
@@ -9999,6 +10715,7 @@
         var savedGenType = GEN_TYPE_VIDEO;
         var savedImagePrompt = "";
         var shared = null;
+
         var state = getState();
         var currentVideoSettings = getVideoGenSettings(state);
 
@@ -10055,6 +10772,9 @@
         if (resolutionSelect) {
             resolutionSelect.value = String(currentVideoSettings.resolution || "720p").toLowerCase();
         }
+        if (seedInput) {
+            seedInput.value = typeof currentVideoSettings.seed === "number" ? String(currentVideoSettings.seed) : "";
+        }
         if (imagePromptInput) {
             imagePromptInput.value = savedImagePrompt || savedPrompt || "";
         }
@@ -10066,7 +10786,8 @@
                 model: trimText(modelSelect ? modelSelect.value : currentVideoSettings.model) || MODEL_VEO_31,
                 aspectRatio: normalizeAspectRatio(aspectRatioSelect ? aspectRatioSelect.value : currentVideoSettings.aspectRatio),
                 durationSeconds: parseInt(durationSecondsSelect ? durationSecondsSelect.value : currentVideoSettings.durationSeconds, 10) || 8,
-                resolution: String(resolutionSelect ? resolutionSelect.value : currentVideoSettings.resolution || "720p").toLowerCase()
+                resolution: String(resolutionSelect ? resolutionSelect.value : currentVideoSettings.resolution || "720p").toLowerCase(),
+                seed: typeof currentVideoSettings.seed === "number" ? currentVideoSettings.seed : null
             }
         });
 
@@ -10075,7 +10796,7 @@
         if (state && (!state.imageGenSettings || !state.imageGenSettings.model)) {
             stateAdapterUpdate({
                 imageGenSettings: {
-                    model: window.VeoApi ? window.VeoApi.DEFAULT_IMAGE_MODEL_ID : "gemini-3.1-flash-image-preview",
+                    model: window.VeoApi ? window.VeoApi.DEFAULT_IMAGE_MODEL_ID : "gemini-3.1-flash-image",
                     aspectRatio: "1:1",
                     imageSize: "1K"
                 }
@@ -10094,7 +10815,7 @@
 
         stateAdapterUpdate({
             imageGenSettings: {
-                model: trimText(modelSelect ? modelSelect.value : "") || current.model || "gemini-3.1-flash-image-preview",
+                model: trimText(modelSelect ? modelSelect.value : "") || current.model || "gemini-3.1-flash-image",
                 aspectRatio: normalizeImageAspectRatio(aspectSelect ? aspectSelect.value : current.aspectRatio || "1:1"),
                 imageSize: normalizeImageSize(sizeSelect ? sizeSelect.value : current.imageSize || "1K")
             }
@@ -10109,7 +10830,8 @@
             model: trimText(patch && patch.model ? patch.model : current.model) || current.model,
             aspectRatio: normalizeAspectRatio(patch && patch.aspectRatio ? patch.aspectRatio : current.aspectRatio),
             durationSeconds: parseInt(patch && patch.durationSeconds !== undefined ? patch.durationSeconds : current.durationSeconds, 10) || 8,
-            resolution: String(patch && patch.resolution ? patch.resolution : current.resolution || "720p").toLowerCase()
+            resolution: String(patch && patch.resolution ? patch.resolution : current.resolution || "720p").toLowerCase(),
+            seed: patch && Object.prototype.hasOwnProperty.call(patch, "seed") ? patch.seed : current.seed
         };
 
         stateAdapterUpdate({
@@ -10278,7 +11000,11 @@
         var btnMediaPreviewCapture = getById("btnMediaPreviewCapture");
         var btnMediaPreviewToFrames = getById("btnMediaPreviewToFrames");
         var btnMediaPreviewReveal = getById("btnMediaPreviewReveal");
+        var btnMediaPreviewExtend = getById("btnMediaPreviewExtend");
         var btnMediaPreviewDelete = getById("btnMediaPreviewDelete");
+        var btnConfirmExtend = getById("btnConfirmExtend");
+        var btnCancelExtend = getById("btnCancelExtend");
+        var extendModal = getById("extendModal");
         var cleanupConfirmModal = getById("cleanupConfirmModal");
         var btnCleanupCancel = getById("btnCleanupCancel");
         var btnCleanupConfirm = getById("btnCleanupConfirm");
@@ -10297,6 +11023,7 @@
         var btnAddVideoRefSelected = getById("btnAddVideoRefSelected");
         var btnClearVideoRefs = getById("btnClearVideoRefs");
         var btnGenerate = getById("btnGenerate");
+        var btnCancelVideo = getById("btnCancelVideo");
         var btnImportVideo = getById("btnImportVideo");
         var btnRevealVideo = getById("btnRevealVideo");
         var btnDeleteVideo = getById("btnDeleteVideo");
@@ -10322,6 +11049,7 @@
         var aspectRatioSelect = getById("aspectRatioSelect");
         var durationSecondsSelect = getById("durationSecondsSelect");
         var resolutionSelect = getById("resolutionSelect");
+        var seedInput = getById("seedInput");
         var promptInput = getById("promptInput");
         var imagePromptInput = getById("imagePromptInput");
         var imageSampleCountSelect = getById("imageSampleCountSelect");
@@ -10436,6 +11164,13 @@
                 }
             });
         }
+        if (btnMediaPreviewExtend) {
+            btnMediaPreviewExtend.addEventListener("click", function () {
+                if (mediaPreviewKind === "video") {
+                    extendGeneratedVideo(mediaPreviewId);
+                }
+            });
+        }
         if (btnMediaPreviewDelete) {
             btnMediaPreviewDelete.addEventListener("click", function () {
                 closeMediaPreviewImportMenu();
@@ -10447,6 +11182,9 @@
                 closeMediaPreview();
             });
         }
+        if (btnConfirmExtend) { btnConfirmExtend.addEventListener("click", confirmExtendGeneratedVideo); }
+        if (btnCancelExtend) { btnCancelExtend.addEventListener("click", function () { pendingExtendVideoId = ""; extendModal.hidden = true; }); }
+        if (extendModal) { extendModal.addEventListener("click", function (event) { if (event.target === extendModal) { pendingExtendVideoId = ""; extendModal.hidden = true; } }); }
         document.addEventListener("click", function (event) {
             if (!mediaPreviewImportMenu || mediaPreviewImportMenu.hidden) {
                 return;
@@ -10527,8 +11265,19 @@
             btnClearVideoRefs.addEventListener("click", clearVideoReferences);
         }
         if (btnGenerate) {
-            btnGenerate.addEventListener("click", onGenerateClick);
+            btnGenerate.addEventListener("click", function (event) {
+                if (event) { event._veoBridgeGenerateHandled = true; }
+                onGenerateClick();
+            });
         }
+        document.addEventListener("click", function (event) {
+            var target = event ? event.target : null;
+            if (target && target.closest) { target = target.closest("#btnGenerate"); }
+            if (!target || target.id !== "btnGenerate" || (event && event._veoBridgeGenerateHandled)) { return; }
+            if (event) { event._veoBridgeGenerateHandled = true; }
+            onGenerateClick();
+        });
+        if (btnCancelVideo) { btnCancelVideo.addEventListener("click", toggleVideoGenerationPause); }
         if (btnVideoFlowOptions) {
             btnVideoFlowOptions.addEventListener("click", function (event) {
                 if (event && event.preventDefault) {
@@ -10683,6 +11432,18 @@
                 renderFlowComposerSummary(getState());
             });
         }
+        if (seedInput) {
+            seedInput.addEventListener("change", function () {
+                var raw = trimText(seedInput.value || "");
+                var nextSeed = raw === "" ? null : Number(raw);
+                if (nextSeed !== null && (!isFinite(nextSeed) || Math.floor(nextSeed) !== nextSeed)) {
+                    setStatus("Seed must be an integer or left empty.", true);
+                    return;
+                }
+                persistVideoGenSettings({ seed: nextSeed });
+                renderFlowComposerSummary(getState());
+            });
+        }
         if (promptInput) {
             promptInput.addEventListener("change", function () {
                 try {
@@ -10760,6 +11521,13 @@
                     closeMediaPreview();
                 }
             }
+            if ((event.key === "Enter" || event.keyCode === 13) && cleanupConfirmModal && !cleanupConfirmModal.hidden) {
+                var cleanupConfirmButton = getById("btnCleanupConfirm");
+                if (cleanupConfirmButton && !cleanupConfirmButton.hidden && !cleanupConfirmButton.disabled) {
+                    cleanupConfirmButton.click();
+                    if (typeof event.preventDefault === "function") { event.preventDefault(); }
+                }
+            }
         });
     }
 
@@ -10822,6 +11590,8 @@
         }());
 
         var initialState = getState();
+        preparePendingVideoRecovery();
+        initialState = getState();
         var initialStaleResult = markStalePendingJobs({
             state: initialState,
             notify: true
@@ -10833,8 +11603,8 @@
         if (!initialStaleResult.changed) {
             setStatus("Ready.", false);
         }
-        setGenerationStatus("Idle.", false);
-        setImageGenerationStatus("Idle.", false);
+        setGenerationStatus("Ready.", false);
+        setImageGenerationStatus("Ready.", false);
         updateUndoDeleteButtonState();
         refreshBusyUi();
         schedulePendingVideoResume(280);
@@ -10873,7 +11643,6 @@
             applyImageLayout();
             saveWindowSizeDebounced();
             updateCarouselDensity();
-            renderAll(getState());
         });
 
         window.addEventListener("focus", function () {
@@ -10886,6 +11655,10 @@
         });
 
         window.addEventListener("beforeunload", function () {
+            if (galleryLoadMoreObserver) { galleryLoadMoreObserver.disconnect(); galleryLoadMoreObserver = null; }
+            if (getRenderAdapter() && typeof getRenderAdapter().disconnectLazyMedia === "function") {
+                getRenderAdapter().disconnectLazyMedia();
+            }
             stopWindowSizeWatcher();
             saveWindowSizeNow();
             stopPendingJobsLeaseHeartbeat();

@@ -12,6 +12,9 @@
     var galleryOpeningTimer = null;
     var galleryHandshakePollTimer = null;
     var currentGalleryOpenNonce = "";
+    var GALLERY_OPEN_REQUEST_EVENT = "com.veobridge.gallery.open.request";
+    var GALLERY_READY_EVENT = "com.veobridge.gallery.ready";
+    var lastDiagnosticDetails = "";
     var COLOR_PRESETS = {
         Green: { r: 0, g: 255, b: 0, hex: "#00ff00" },
         Blue: { r: 0, g: 0, b: 255, hex: "#0000ff" },
@@ -39,6 +42,24 @@
         }
         status.textContent = text;
         status.className = isError ? "status-line is-error" : "status-line";
+        status.title = isError && lastDiagnosticDetails ? lastDiagnosticDetails : "";
+        var detailsButton = getById("btnCopyDiagnostic");
+        if (detailsButton) { detailsButton.hidden = !(isError && lastDiagnosticDetails); }
+    }
+
+    function writeDiagnostic(eventName, details) {
+        var dir;
+        var filePath;
+        var host = readHostEnvironment() || {};
+        var entry = { time: (new Date()).toISOString(), event: eventName, details: String(details || ""), host: host.appName || "AE", hostVersion: host.appVersion || "unknown", cep: "12" };
+        lastDiagnosticDetails = JSON.stringify(entry, null, 2);
+        if (!ensureRuntimeDeps()) { return; }
+        try {
+            dir = path.join(resolveUserDataDir(), "VeoBridge", "logs");
+            if (!ensureDirRecursive(dir)) { return; }
+            filePath = path.join(dir, "veobridge-" + entry.time.substring(0, 10) + ".log");
+            fs.appendFileSync(filePath, JSON.stringify(entry) + "\n", "utf8");
+        } catch (ignoreLogError) {}
     }
 
     function ensureCs() {
@@ -240,11 +261,13 @@
     }
 
     function beginGalleryOpenAttempt() {
+        var attemptNonce;
         if (isGalleryOpening) {
             return false;
         }
         isGalleryOpening = true;
         currentGalleryOpenNonce = "gallery_" + String(new Date().getTime()) + "_" + String(Math.floor(Math.random() * 1000000));
+        attemptNonce = currentGalleryOpenNonce;
         if (galleryOpeningTimer && typeof window.clearTimeout === "function") {
             window.clearTimeout(galleryOpeningTimer);
             galleryOpeningTimer = null;
@@ -255,14 +278,34 @@
         }
         if (typeof window.setTimeout === "function") {
             galleryOpeningTimer = window.setTimeout(function () {
+                var runtime;
+                galleryOpeningTimer = null;
+                if (!isGalleryOpening || currentGalleryOpenNonce !== attemptNonce) {
+                    return;
+                }
+                // CEP can suspend timers in the launcher as soon as a modeless window
+                // takes focus. Always re-check the durable acknowledgement before
+                // reporting a timeout when the launcher is scheduled again.
+                if (hasGalleryRuntimeAck(attemptNonce)) {
+                    finishGalleryOpenSuccess("storage:late-ack");
+                    return;
+                }
                 if (galleryHandshakePollTimer && typeof window.clearInterval === "function") {
                     window.clearInterval(galleryHandshakePollTimer);
                     galleryHandshakePollTimer = null;
                 }
+                runtime = readRuntimeState();
+                writeDiagnostic("gallery_open_timeout", JSON.stringify({
+                    extensionId: "com.veobridge.gallery",
+                    requestedNonce: attemptNonce,
+                    pendingOpenNonce: runtime.pendingOpenNonce || "",
+                    galleryReadyNonce: runtime.galleryReadyNonce || "",
+                    galleryLastSeenAt: runtime.galleryLastSeenAt || null
+                }));
                 setStatus(withOpenDebug("Gallery opening timed out.", getGalleryOpenStrategyHint()), true);
                 isGalleryOpening = false;
-                galleryOpeningTimer = null;
-            }, 2500);
+                currentGalleryOpenNonce = "";
+            }, 6000);
         }
         return true;
     }
@@ -281,11 +324,16 @@
     }
 
     function parseHostResult(raw) {
+        var parsed;
         if (typeof raw !== "string") {
             return null;
         }
         try {
-            return JSON.parse(raw);
+            parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== "object" || typeof parsed.ok !== "boolean") {
+                return null;
+            }
+            return parsed;
         } catch (error) {
             return null;
         }
@@ -301,10 +349,22 @@
         bridge.evalScript(script, function (raw) {
             var parsed = parseHostResult(raw);
             var message;
+            var hostError;
 
             if (!parsed) {
                 message = String(raw || "");
-                callback(new Error("Host script failed: " + (message || "Empty response")), null);
+                writeDiagnostic("host.invalid_response", "script=" + script + " raw=" + message);
+                if (!message) {
+                    hostError = new Error("Host returned an empty response [EMPTY_HOST_RESPONSE].");
+                    hostError.code = "EMPTY_HOST_RESPONSE";
+                } else if (/^EvalScript error\.?/i.test(message.replace(/^\s+|\s+$/g, ""))) {
+                    hostError = new Error("After Effects could not evaluate the JSX bridge [EVALSCRIPT_ERROR]. Open Settings > Test host.");
+                    hostError.code = "EVALSCRIPT_ERROR";
+                } else {
+                    hostError = new Error("Host returned invalid or truncated JSON [INVALID_HOST_RESPONSE].");
+                    hostError.code = "INVALID_HOST_RESPONSE";
+                }
+                callback(hostError, null);
                 return;
             }
 
@@ -313,13 +373,12 @@
                 if (parsed.code) {
                     message += " [" + parsed.code + "]";
                 }
-                if (parsed.path) {
-                    message += " Path: " + String(parsed.path);
-                }
-                if (parsed.details) {
-                    message += " " + String(parsed.details);
-                }
-                callback(new Error(message), parsed);
+                if (parsed.stage) { message += " (stage: " + String(parsed.stage) + ")"; }
+                writeDiagnostic("host.error", "script=" + script + " response=" + JSON.stringify(parsed));
+                hostError = new Error(message);
+                hostError.code = parsed.code || "HOST_ERROR";
+                hostError.hostResponse = parsed;
+                callback(hostError, parsed);
                 return;
             }
 
@@ -794,6 +853,26 @@
         });
     }
 
+    function runHostDiagnostic(command, label) {
+        setStatus(label + "...", false);
+        callHost(command, function (error, payload) {
+            if (error) { setStatus(label + " failed: " + error.message, true); return; }
+            lastDiagnosticDetails = JSON.stringify(payload || {}, null, 2);
+            setStatus(label + " passed" + (payload && payload.path ? ": " + payload.path : "."), false);
+        });
+    }
+
+    function copyDiagnosticDetails() {
+        var result;
+        if (!lastDiagnosticDetails) { return; }
+        try {
+            if (typeof require !== "function") { throw new Error("Clipboard runtime is unavailable."); }
+            result = require("child_process").spawnSync("clip.exe", [], { input: lastDiagnosticDetails, encoding: "utf8", windowsHide: true });
+            if (!result || result.error || result.status !== 0) { throw (result && result.error ? result.error : new Error("Clipboard command failed.")); }
+            setStatus("Error details copied.", false);
+        } catch (error) { setStatus("Could not copy error details.", true); }
+    }
+
     function requestGalleryOpen() {
         var bridge = ensureCs();
         if (!bridge || typeof bridge.requestOpenExtension !== "function") {
@@ -802,13 +881,57 @@
         bridge.requestOpenExtension("com.veobridge.gallery", "");
     }
 
+    function dispatchGalleryOpenRequest(nonce) {
+        var bridge = ensureCs();
+        var event;
+        if (!bridge || typeof bridge.dispatchEvent !== "function" || typeof window.CSEvent !== "function") {
+            return;
+        }
+        event = new window.CSEvent(GALLERY_OPEN_REQUEST_EVENT, "APPLICATION");
+        event.data = JSON.stringify({ nonce: String(nonce || "") });
+        bridge.dispatchEvent(event);
+    }
+
     function hasGalleryRuntimeAck(nonce) {
         var runtime = readRuntimeState();
         return runtime && runtime.galleryReadyNonce === nonce;
     }
 
+    function finishGalleryOpenSuccess(strategy) {
+        if (!isGalleryOpening) {
+            return;
+        }
+        endGalleryOpenAttempt();
+        setStatus(withOpenDebug("Gallery opened.", strategy || "storage:handshake"), false);
+    }
+
+    function onGalleryReadyEvent(event) {
+        var data = event && event.data;
+        var parsed = null;
+        var nonce = "";
+
+        try {
+            parsed = typeof data === "string" ? JSON.parse(data) : data;
+        } catch (error) {
+            parsed = null;
+        }
+        nonce = parsed && parsed.nonce ? String(parsed.nonce) : "";
+        if (!isGalleryOpening || !currentGalleryOpenNonce) {
+            return;
+        }
+        if (nonce === currentGalleryOpenNonce || hasGalleryRuntimeAck(currentGalleryOpenNonce)) {
+            finishGalleryOpenSuccess("cep-event:ready");
+        }
+    }
+
+    function bindGalleryReadyBridge() {
+        var bridge = ensureCs();
+        if (bridge && typeof bridge.addEventListener === "function") {
+            bridge.addEventListener(GALLERY_READY_EVENT, onGalleryReadyEvent);
+        }
+    }
+
     function startGalleryOpenHandshake(nonce, osFamily) {
-        var settleDelayMs = osFamily === "win" ? 750 : 0;
         if (typeof window.setInterval !== "function") {
             return;
         }
@@ -827,20 +950,10 @@
                 window.clearInterval(galleryHandshakePollTimer);
                 galleryHandshakePollTimer = null;
             }
-            window.setTimeout(function () {
-                if (!isGalleryOpening || !nonce || currentGalleryOpenNonce !== nonce) {
-                    return;
-                }
-                try {
-                    requestGalleryOpen();
-                    endGalleryOpenAttempt();
-                    setStatus(withOpenDebug("Gallery opened.", osFamily === "win" ? "win:storage:handshake" : "storage:handshake"), false);
-                } catch (error) {
-                    endGalleryOpenAttempt();
-                    setStatus(withOpenDebug("Failed to open Gallery window.", osFamily === "win" ? "win:storage:handshake" : "storage:handshake"), true);
-                }
-            }, settleDelayMs);
-        }, 40);
+            // requestOpenExtension already launches or activates the target. Calling
+            // it again here can create extra CEP processes for Modeless extensions.
+            finishGalleryOpenSuccess(osFamily === "win" ? "win:storage:handshake" : "storage:handshake");
+        }, 80);
     }
 
     function openGalleryWindow() {
@@ -856,7 +969,6 @@
 
         try {
             openNonce = currentGalleryOpenNonce;
-            requestGalleryOpen();
             writeOk = writeRuntimeStatePatch({
                 pendingOpenNonce: openNonce,
                 pendingOpenRequestedAt: new Date().getTime(),
@@ -865,13 +977,21 @@
             if (writeOk) {
                 startGalleryOpenHandshake(openNonce, osFamily);
                 setStatus(withOpenDebug("Opening Gallery...", osFamily === "win" ? "win:storage:requestOpenExtension" : "storage:requestOpenExtension"), false);
+                // Notify an already-running Gallery before asking CEP to activate it.
+                // A newly created Gallery will acknowledge the nonce during boot.
+                dispatchGalleryOpenRequest(openNonce);
+                requestGalleryOpen();
             } else {
                 endGalleryOpenAttempt();
+                writeDiagnostic("gallery_open_handshake_init_failed", "Could not write runtime.json");
                 setStatus(withOpenDebug("Gallery open handshake could not initialize.", primaryStrategy), true);
             }
         } catch (error) {
-            endGalleryOpenAttempt();
-            setStatus(withOpenDebug("Failed to open Gallery window.", primaryStrategy), true);
+            if (isGalleryOpening) {
+                endGalleryOpenAttempt();
+                writeDiagnostic("gallery_open_failed", error && error.stack ? error.stack : String(error || "Unknown error"));
+                setStatus(withOpenDebug("Failed to open Gallery window.", primaryStrategy), true);
+            }
         }
     }
 
@@ -896,9 +1016,12 @@
                 shared = window.VeoBridgeSettings.loadSettings();
                 if (shared && shared.apiKey) {
                     saved = String(shared.apiKey);
+                } else if (saved && typeof window.VeoBridgeSettings.saveSettings === "function") {
+                    window.VeoBridgeSettings.saveSettings({ apiKey: saved });
+                    try { window.localStorage.removeItem(STORAGE_KEY_API_KEY); } catch (removeLegacyError) {}
                 }
             } catch (loadSettingsError) {
-                // ignore
+                writeDiagnostic("settings.load_failed", loadSettingsError);
             }
         }
 
@@ -950,12 +1073,6 @@
         var value = input ? String(input.value || "") : "";
         var saveError = null;
 
-        try {
-            window.localStorage.setItem(STORAGE_KEY_API_KEY, value);
-        } catch (error) {
-            saveError = error;
-        }
-
         if (window.VeoBridgeSettings && typeof window.VeoBridgeSettings.saveSettings === "function") {
             try {
                 window.VeoBridgeSettings.saveSettings({ apiKey: value });
@@ -964,6 +1081,9 @@
                     saveError = settingsError;
                 }
             }
+        }
+        if (!saveError) {
+            try { window.localStorage.removeItem(STORAGE_KEY_API_KEY); } catch (removeLegacyError) {}
         }
 
         closeSettingsModal();
@@ -1030,6 +1150,9 @@
         var btnCreateComp = getById("btnCreateComp");
         var btnSettings = getById("btnSettings");
         var btnSaveApiKey = getById("btnSaveApiKey");
+        var btnHostPing = getById("btnHostPing");
+        var btnCaptureProbe = getById("btnCaptureProbe");
+        var btnCopyDiagnostic = getById("btnCopyDiagnostic");
         var btnCloseSettings = getById("btnCloseSettings");
         var btnSubmitCreateComp = getById("btnSubmitCreateComp");
         var btnColorSwatch = getById("btnColorSwatch");
@@ -1063,6 +1186,9 @@
         if (btnSaveApiKey) {
             btnSaveApiKey.addEventListener("click", saveSettings);
         }
+        if (btnHostPing) { btnHostPing.addEventListener("click", function () { runHostDiagnostic("VeoBridge_ping()", "Host test"); }); }
+        if (btnCaptureProbe) { btnCaptureProbe.addEventListener("click", function () { runHostDiagnostic("VeoBridge_captureProbe()", "Capture test"); }); }
+        if (btnCopyDiagnostic) { btnCopyDiagnostic.addEventListener("click", copyDiagnosticDetails); }
         if (btnCloseSettings) {
             btnCloseSettings.addEventListener("click", closeSettingsModal);
         }
@@ -1192,6 +1318,7 @@
 
     document.addEventListener("DOMContentLoaded", function () {
         bindActions();
+        bindGalleryReadyBridge();
         setCreateCompCustomColor(COLOR_PRESETS.Green);
 
         if (!window.VeoBridgeState || typeof window.VeoBridgeState.ensurePaths !== "function") {

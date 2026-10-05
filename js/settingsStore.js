@@ -231,62 +231,87 @@
         };
     }
 
-    function loadSettings() {
+    function _secureStoreAvailable() {
+        var store = global.VeoBridgeSecureStore;
+        if (!store || typeof store.loadApiKey !== "function" || typeof store.saveApiKey !== "function") {
+            return false;
+        }
+        if (typeof store.isAvailable === "function") {
+            try { return !!store.isAvailable(); } catch (error) { return false; }
+        }
+        return true;
+    }
+
+    function _readRawSettings() {
         var filePath = _getSettingsFilePath();
         var raw;
-        var parsed;
-
-        if (!fs || !filePath) {
-            return _clone(DEFAULT_SETTINGS);
-        }
-
+        if (!fs || !filePath) { return _clone(DEFAULT_SETTINGS); }
         try {
-            if (!fs.existsSync(filePath)) {
-                return _clone(DEFAULT_SETTINGS);
-            }
-        } catch (existsError) {
-            return _clone(DEFAULT_SETTINGS);
-        }
-
-        try {
+            if (!fs.existsSync(filePath)) { return _clone(DEFAULT_SETTINGS); }
             raw = fs.readFileSync(filePath, "utf8");
-            parsed = raw ? JSON.parse(raw) : {};
-            return _normalize(parsed);
+            return _normalize(raw ? JSON.parse(raw) : {});
         } catch (error) {
             return _clone(DEFAULT_SETTINGS);
         }
     }
 
+    function _writeSettings(settings) {
+        var filePath = _getSettingsFilePath();
+        var dirPath;
+        if (!fs || !path || !filePath) { throw new Error("Settings storage is unavailable."); }
+        dirPath = path.dirname(filePath);
+        if (!_ensureDirRecursive(dirPath)) { throw new Error("Settings directory could not be created."); }
+        try {
+            fs.writeFileSync(filePath, JSON.stringify(settings, null, 2), "utf8");
+        } catch (error) {
+            throw new Error("Settings file could not be written: " + String(error));
+        }
+    }
+
+    function loadSettings() {
+        var parsed = _readRawSettings();
+        var secureAvailable = _secureStoreAvailable();
+
+        if (parsed.apiKey && secureAvailable) {
+            try {
+                global.VeoBridgeSecureStore.saveApiKey(String(parsed.apiKey));
+                if (global.VeoBridgeSecureStore.loadApiKey() === String(parsed.apiKey)) {
+                    parsed.apiKey = "";
+                    _writeSettings(parsed);
+                }
+            } catch (migrationError) {}
+        }
+        if (secureAvailable) {
+            try {
+                parsed.apiKey = global.VeoBridgeSecureStore.loadApiKey() || parsed.apiKey;
+            } catch (secureError) {
+                // Keep a legacy plaintext key readable if DPAPI is temporarily unavailable.
+            }
+        }
+        return parsed;
+    }
+
     function saveSettings(patch) {
         patch = patch || {};
-        var current = loadSettings();
+        var current = _readRawSettings();
+        var secureAvailable = _secureStoreAvailable();
         var mergedLayout = typeof patch.layout !== "undefined" ? _deepMerge(current.layout, patch.layout) : current.layout;
         var mergedWindow = typeof patch.window !== "undefined" ? _deepMerge(current.window, patch.window) : current.window;
-        var next = _normalize({
-            apiKey: typeof patch.apiKey !== "undefined" ? patch.apiKey : current.apiKey,
+        var requestedApiKey = typeof patch.apiKey !== "undefined" ? String(patch.apiKey || "") : current.apiKey;
+        var next;
+
+        if (secureAvailable && (typeof patch.apiKey !== "undefined" || current.apiKey)) {
+            global.VeoBridgeSecureStore.saveApiKey(requestedApiKey);
+        }
+
+        next = _normalize({
+            apiKey: secureAvailable ? "" : requestedApiKey,
             modelId: typeof patch.modelId !== "undefined" ? patch.modelId : current.modelId,
             aspectRatio: typeof patch.aspectRatio !== "undefined" ? patch.aspectRatio : current.aspectRatio,
             window: mergedWindow,
             layout: mergedLayout
         });
-        var filePath = _getSettingsFilePath();
-        var dirPath;
-
-        if (!fs || !path || !filePath) {
-            return _clone(next);
-        }
-
-        dirPath = path.dirname(filePath);
-        if (!_ensureDirRecursive(dirPath)) {
-            return _clone(next);
-        }
-
-        try {
-            fs.writeFileSync(filePath, JSON.stringify(next, null, 2), "utf8");
-        } catch (error) {
-            return _clone(next);
-        }
-
+        _writeSettings(next);
         return _clone(next);
     }
 

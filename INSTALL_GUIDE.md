@@ -2,15 +2,15 @@
 
 ### macOS (`.pkg`)
 
-1. Close After Effects.
+1. Save the project, then fully close After Effects and every `CEPHtmlEngine` process so an older Gallery cannot keep the queue lease alive.
 2. Install the package:
 ```bash
-open ~/Downloads/Veo-Bridge-0.1.0.pkg
+open ~/Downloads/Veo-Bridge-0.4.1.pkg
 ```
 3. If macOS blocks it (Gatekeeper):
 ```bash
-xattr -dr com.apple.quarantine ~/Downloads/Veo-Bridge-0.1.0.pkg
-open ~/Downloads/Veo-Bridge-0.1.0.pkg
+xattr -dr com.apple.quarantine ~/Downloads/Veo-Bridge-0.4.1.pkg
+open ~/Downloads/Veo-Bridge-0.4.1.pkg
 ```
 4. Enable CEP debug mode:
 ```bash
@@ -35,7 +35,7 @@ sudo rm -rf "/Library/Application Support/Adobe/CEP/extensions/Veo-Bridge"
 1. Close After Effects.
 2. Install MSI (double-click), or via command:
 ```bat
-msiexec /i "%USERPROFILE%\Downloads\Veo-Bridge-0.1.0.msi"
+msiexec /i "%USERPROFILE%\Downloads\Veo-Bridge-0.4.1.msi"
 ```
 3. If SmartScreen blocks it: click `More info` -> `Run anyway`.
 4. Enable CEP debug mode:
@@ -53,7 +53,7 @@ explorer "%APPDATA%\Adobe\CEP\extensions\Veo-Bridge"
 
 Uninstall:
 ```bat
-msiexec /x "%USERPROFILE%\Downloads\Veo-Bridge-0.1.0.msi"
+msiexec /x "%USERPROFILE%\Downloads\Veo-Bridge-0.4.1.msi"
 ```
 
 ### Troubleshooting

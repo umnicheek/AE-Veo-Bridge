@@ -2,12 +2,12 @@
 <ExtensionManifest
     Version="7.0"
     ExtensionBundleId="com.veobridge.bundle"
-    ExtensionBundleVersion="0.1.0"
+    ExtensionBundleVersion="0.4.1"
     ExtensionBundleName="Veo Bridge"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
     <ExtensionList>
-        <Extension Id="com.veobridge.panel" Version="0.1.0" />
-        <Extension Id="com.veobridge.gallery" Version="0.1.0" />
+        <Extension Id="com.veobridge.panel" Version="0.4.1" />
+        <Extension Id="com.veobridge.gallery" Version="0.4.1" />
     </ExtensionList>
 
     <ExecutionEnvironment>

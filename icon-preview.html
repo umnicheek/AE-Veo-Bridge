@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Veo Bridge Icon Preview</title>
+    <style>
+        :root {
+            --bg: #202124;
+            --panel: #2a2d31;
+            --panel-2: #30343a;
+            --line: #4a4f57;
+            --text: #eef2f7;
+            --text-soft: #b2bac6;
+            --accent: #4676be;
+            --accent-hover: #5a89cf;
+            --danger: #8a3744;
+            --danger-hover: #a14554;
+            --utility: #3d4958;
+            --utility-hover: #4d5c70;
+            --warn: #6b4a23;
+            --radius: 4px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: linear-gradient(180deg, #1c1d20 0%, #202124 100%);
+            color: var(--text);
+            font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        h1,
+        h2,
+        h3,
+        p {
+            margin: 0;
+        }
+
+        .page {
+            max-width: 1160px;
+            margin: 0 auto;
+            display: grid;
+            gap: 18px;
+        }
+
+        .hero {
+            padding: 16px 18px;
+            border: 1px solid #343942;
+            border-radius: 8px;
+            background: #23262b;
+        }
+
+        .hero h1 {
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .hero p {
+            color: var(--text-soft);
+            max-width: 900px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1.2fr 1fr;
+            gap: 18px;
+        }
+
+        .card {
+            padding: 16px;
+            border: 1px solid #343942;
+            border-radius: 8px;
+            background: #23262b;
+            display: grid;
+            gap: 14px;
+        }
+
+        .section-title {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .section-note {
+            color: var(--text-soft);
+            font-size: 12px;
+        }
+
+        .toolbar,
+        .button-row,
+        .mode-row,
+        .hover-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            min-height: 28px;
+            padding: 0 10px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--panel-2);
+            color: var(--text);
+            text-decoration: none;
+            user-select: none;
+        }
+
+        .btn:hover {
+            background: #363b42;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            border-color: #6f95d2;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-utility {
+            background: var(--utility);
+            border-color: #69798f;
+        }
+
+        .btn-utility:hover {
+            background: var(--utility-hover);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            border-color: #c86673;
+        }
+
+        .btn-danger:hover {
+            background: var(--danger-hover);
+        }
+
+        .btn-warning {
+            background: var(--warn);
+            border-color: #a07a44;
+        }
+
+        .icon-btn {
+            width: 28px;
+            min-width: 28px;
+            padding: 0;
+        }
+
+        .icon {
+            width: 14px;
+            height: 14px;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 1.9;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            flex: 0 0 auto;
+        }
+
+        .icon-solid {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+            stroke: none;
+            flex: 0 0 auto;
+        }
+
+        .launcher-strip {
+            padding: 12px;
+            border: 1px solid #343942;
+            border-radius: 6px;
+            background: #26292e;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .status-line {
+            padding: 8px 10px;
+            border-top: 1px solid #333842;
+            color: var(--text-soft);
+            font-size: 12px;
+        }
+
+        .floating {
+            padding: 12px;
+            border: 1px solid #343942;
+            border-radius: 8px;
+            background: #242930;
+            display: grid;
+            gap: 10px;
+        }
+
+        .hover-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 24px;
+            padding: 0 8px;
+            border: 1px solid var(--line);
+            border-radius: 4px;
+            background: rgba(36, 40, 46, 0.94);
+            color: var(--text);
+            font-size: 12px;
+        }
+
+        .hover-chip-danger {
+            background: rgba(116, 45, 57, 0.94);
+            border-color: #bf6473;
+        }
+
+        .seg {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 30px;
+            padding: 0 12px;
+            border: 1px solid #49505b;
+            border-radius: 4px;
+            background: #262c34;
+            color: #dfe5ee;
+        }
+
+        .seg-active {
+            background: #3d5f97;
+            border-color: #7aa2e4;
+        }
+
+        .list {
+            display: grid;
+            gap: 8px;
+            padding-left: 0;
+            list-style: none;
+        }
+
+        .list li {
+            display: grid;
+            grid-template-columns: 104px 1fr;
+            gap: 10px;
+            align-items: start;
+            color: var(--text-soft);
+        }
+
+        .list strong {
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        .caption {
+            color: var(--text-soft);
+            font-size: 12px;
+        }
+
+        @media (max-width: 940px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <svg width="0" height="0" style="position:absolute">
+        <symbol id="i-gear" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3.4"></circle>
+            <path d="M12 2.9v2.2"></path>
+            <path d="M12 18.9v2.2"></path>
+            <path d="M21.1 12h-2.2"></path>
+            <path d="M5.1 12H2.9"></path>
+            <path d="M18.4 5.6l-1.6 1.6"></path>
+            <path d="M7.2 16.8l-1.6 1.6"></path>
+            <path d="M18.4 18.4l-1.6-1.6"></path>
+            <path d="M7.2 7.2L5.6 5.6"></path>
+            <circle cx="12" cy="12" r="7.2"></circle>
+        </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24">
+            <path d="M20 11a8 8 0 0 0-13.7-4.9"></path>
+            <path d="M4 4v5h5"></path>
+            <path d="M4 13a8 8 0 0 0 13.7 4.9"></path>
+            <path d="M20 20v-5h-5"></path>
+        </symbol>
+        <symbol id="i-close" viewBox="0 0 24 24">
+            <path d="M6 6l12 12"></path>
+            <path d="M18 6l-12 12"></path>
+        </symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24">
+            <path d="M3 7.5h6l2 2H21v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7.5Z"></path>
+        </symbol>
+        <symbol id="i-import" viewBox="0 0 24 24">
+            <path d="M12 4v10"></path>
+            <path d="M8 10l4 4l4-4"></path>
+            <path d="M4 18h16"></path>
+        </symbol>
+        <symbol id="i-image" viewBox="0 0 24 24">
+            <rect x="4" y="5" width="16" height="14" rx="2"></rect>
+            <path d="M8 14l2.5-2.5L16 17"></path>
+            <circle cx="9" cy="9" r="1.2"></circle>
+        </symbol>
+        <symbol id="i-video" viewBox="0 0 24 24">
+            <rect x="3" y="6" width="13" height="12" rx="2"></rect>
+            <path d="M16 10l5-3v10l-5-3Z"></path>
+        </symbol>
+        <symbol id="i-frames" viewBox="0 0 24 24">
+            <rect x="4" y="4" width="7" height="7" rx="1.5"></rect>
+            <rect x="13" y="4" width="7" height="7" rx="1.5"></rect>
+            <rect x="4" y="13" width="7" height="7" rx="1.5"></rect>
+            <rect x="13" y="13" width="7" height="7" rx="1.5"></rect>
+        </symbol>
+        <symbol id="i-ingredients" viewBox="0 0 24 24">
+            <path d="M7 4v16"></path>
+            <path d="M17 4v16"></path>
+            <path d="M7 8h10"></path>
+            <path d="M7 16h10"></path>
+            <path d="M12 4v16"></path>
+        </symbol>
+        <symbol id="i-camera" viewBox="0 0 24 24">
+            <path d="M4 8h3l1.4-2h7.2L17 8h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z"></path>
+            <circle cx="12" cy="14" r="3.2"></circle>
+        </symbol>
+        <symbol id="i-grid" viewBox="0 0 24 24">
+            <rect x="4" y="4" width="6.5" height="6.5" rx="1.4"></rect>
+            <rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"></rect>
+            <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"></rect>
+            <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"></rect>
+        </symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24">
+            <path d="M12 5v14"></path>
+            <path d="M5 12h14"></path>
+        </symbol>
+    </svg>
+
+    <div class="page">
+        <div class="hero">
+            <h1>Phase 4 Icon Preview</h1>
+            <p>
+                This is a preview-only proposal for icon-first controls. The target is AE-like neutrality:
+                small monochrome SVGs, compact actions, and icon-only usage only where meaning is stable.
+            </p>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2 class="section-title">Launcher Proposal</h2>
+                <p class="section-note">Keep button names for now, but standardize icon language and proportions.</p>
+                <div class="launcher-strip">
+                    <button class="btn icon-btn" title="Create composition">
+                        <svg class="icon"><use href="#i-plus"></use></svg>
+                    </button>
+                    <button class="btn btn-primary" title="Capture frame">
+                        <svg class="icon"><use href="#i-camera"></use></svg>
+                        <span>Capture</span>
+                    </button>
+                    <button class="btn btn-utility" title="Open gallery">
+                        <svg class="icon"><use href="#i-grid"></use></svg>
+                        <span>Gallery</span>
+                    </button>
+                    <button class="btn icon-btn" title="Settings">
+                        <svg class="icon"><use href="#i-gear"></use></svg>
+                    </button>
+                </div>
+                <div class="status-line">Ready. Example status line with lower visual weight.</div>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Mapping Proposal</h2>
+                <ul class="list">
+                    <li><strong>Icon-only</strong><span>Settings, Refresh, small Delete, small Close, Reveal in hover toolbars, launcher plus.</span></li>
+                    <li><strong>Icon + text</strong><span>Capture, Gallery, Import, Image, Video, Frames, Ingredients.</span></li>
+                    <li><strong>Text-only</strong><span>Cleanup, Diagnostics, Undo Delete. These are less obvious and should stay explicit.</span></li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Hover Toolbar Proposal</h2>
+                <p class="section-note">Most of the visual clutter goes away if hover actions become icon-first.</p>
+                <div class="hover-row">
+                    <span class="hover-chip" title="Import to AE">
+                        <svg class="icon"><use href="#i-import"></use></svg>
+                    </span>
+                    <span class="hover-chip" title="Reveal in Finder / Explorer">
+                        <svg class="icon"><use href="#i-folder"></use></svg>
+                    </span>
+                    <span class="hover-chip" title="Add to Frames">
+                        <svg class="icon"><use href="#i-frames"></use></svg>
+                    </span>
+                    <span class="hover-chip hover-chip-danger" title="Delete from VeoBridge">
+                        <svg class="icon"><use href="#i-close"></use></svg>
+                    </span>
+                </div>
+                <p class="caption">Delete/close use the same geometric icon. Only color semantics change.</p>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Batch Actions Proposal</h2>
+                <div class="button-row">
+                    <button class="btn icon-btn btn-utility" title="Reuse batch settings">
+                        <svg class="icon"><use href="#i-refresh"></use></svg>
+                    </button>
+                    <button class="btn icon-btn btn-danger" title="Delete batch">
+                        <svg class="icon"><use href="#i-close"></use></svg>
+                    </button>
+                </div>
+                <p class="caption">This replaces text-based tiny buttons and fixes centering inconsistencies.</p>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Composer Modes Proposal</h2>
+                <p class="section-note">No emoji. Small monochrome SVGs are more stable and look closer to native tool UI.</p>
+                <div class="mode-row">
+                    <button class="seg seg-active">
+                        <svg class="icon"><use href="#i-image"></use></svg>
+                        <span>Image</span>
+                    </button>
+                    <button class="seg">
+                        <svg class="icon"><use href="#i-video"></use></svg>
+                        <span>Video</span>
+                    </button>
+                </div>
+                <div class="mode-row">
+                    <button class="seg seg-active">
+                        <svg class="icon"><use href="#i-frames"></use></svg>
+                        <span>Frames</span>
+                    </button>
+                    <button class="seg">
+                        <svg class="icon"><use href="#i-ingredients"></use></svg>
+                        <span>Ingredients</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Overlay Action Bar Proposal</h2>
+                <div class="button-row">
+                    <button class="btn btn-primary">
+                        <svg class="icon"><use href="#i-import"></use></svg>
+                        <span>Import</span>
+                    </button>
+                    <button class="btn btn-utility">
+                        <svg class="icon"><use href="#i-folder"></use></svg>
+                        <span>Reveal</span>
+                    </button>
+                    <button class="btn btn-danger">
+                        <svg class="icon"><use href="#i-close"></use></svg>
+                        <span>Delete</span>
+                    </button>
+                    <button class="btn">
+                        <svg class="icon"><use href="#i-close"></use></svg>
+                        <span>Close</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "veo-bridge",
+  "version": "0.4.1",
+  "private": true,
+  "scripts": {
+    "test": "node tests/run-tests.js && node tests/host-transport-tests.js && node tests/state-concurrency-tests.js && node tests/transport-tests.js && node tests/release-consistency-tests.js",
+    "test:ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/run-browser-button-smoke.ps1",
+    "check": "node tests/check-syntax.js"
+  }
+}

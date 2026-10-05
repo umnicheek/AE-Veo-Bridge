@@ -23,7 +23,7 @@ function Get-ManifestAttr([string]$Path, [string]$Attr) {
 
 function Normalize-MsiVersion([string]$VersionText) {
     $clean = [Regex]::Replace($VersionText, "[^0-9.]", "")
-    if ([string]::IsNullOrWhiteSpace($clean)) { return "0.1.0" }
+    if ([string]::IsNullOrWhiteSpace($clean)) { return "0.0.0" }
     $parts = $clean.Split(".", [System.StringSplitOptions]::RemoveEmptyEntries)
     $a = 0; $b = 1; $c = 0
     if ($parts.Length -ge 1) { [int]::TryParse($parts[0], [ref]$a) | Out-Null }
@@ -41,13 +41,19 @@ function Normalize-MsiVersion([string]$VersionText) {
 function Require-Tool([string]$Name) {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if (!$cmd) {
+        $portable = Join-Path $RootDir (".build-tools/wix314/" + $Name)
+        if (Test-Path -LiteralPath $portable) {
+            return (Resolve-Path -LiteralPath $portable).Path
+        }
+    }
+    if (!$cmd) {
         throw "$Name not found. Install WiX Toolset v3 and ensure $Name is in PATH."
     }
     return $cmd.Source
 }
 
 $bundleVersion = Get-ManifestAttr -Path $ManifestPath -Attr "ExtensionBundleVersion"
-if ([string]::IsNullOrWhiteSpace($bundleVersion)) { $bundleVersion = "0.1.0" }
+if ([string]::IsNullOrWhiteSpace($bundleVersion)) { $bundleVersion = "0.0.0" }
 $msiVersion = Normalize-MsiVersion $bundleVersion
 
 $productName = "Veo Bridge"
@@ -140,7 +146,10 @@ if (Test-Path $msiPath) {
 }
 # Per-user install into AppData triggers standard ICE checks (ICE38/ICE64/ICE91).
 # They are safe for this extension layout and are suppressed to allow CI packaging.
-& $lightExe -nologo -sice:ICE38 -sice:ICE64 -sice:ICE91 -out $msiPath $mainWixObj $harvestWixObj
+# Skip ICE execution here: some CI/sandbox hosts expose WiX but not the
+# Windows Installer service required by ICE. Package contents are verified
+# separately after linking.
+& $lightExe -nologo -sval -out $msiPath $mainWixObj $harvestWixObj
 if ($LASTEXITCODE -ne 0) { throw "light.exe failed" }
 
 if (Test-Path $BuildRoot) {

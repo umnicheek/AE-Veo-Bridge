@@ -77,6 +77,15 @@ $certCommonName = $config["CERT_COMMON_NAME"]
 $certOrg = $config["CERT_ORG"]
 $certOrgUnit = $config["CERT_ORG_UNIT"]
 
+# Process-only overrides let CI/local release builds use a temporary password
+# without persisting it in the repository or package configuration.
+$zxOverride = [Environment]::GetEnvironmentVariable("VEO_BRIDGE_ZXPSIGN_CMD", "Process")
+$certPathOverride = [Environment]::GetEnvironmentVariable("VEO_BRIDGE_CERT_PATH", "Process")
+$certPasswordOverride = [Environment]::GetEnvironmentVariable("VEO_BRIDGE_CERT_PASSWORD", "Process")
+if (![string]::IsNullOrWhiteSpace($zxOverride)) { $zx = $zxOverride }
+if (![string]::IsNullOrWhiteSpace($certPathOverride)) { $certPath = $certPathOverride }
+if (![string]::IsNullOrWhiteSpace($certPasswordOverride)) { $certPassword = $certPasswordOverride }
+
 if ([string]::IsNullOrWhiteSpace($zx)) {
     $cmd = Get-Command ZXPSignCMD -ErrorAction SilentlyContinue
     if ($cmd) { $zx = $cmd.Source }
@@ -84,6 +93,10 @@ if ([string]::IsNullOrWhiteSpace($zx)) {
 if ([string]::IsNullOrWhiteSpace($zx)) {
     $cmd = Get-Command ZXPSignCmd -ErrorAction SilentlyContinue
     if ($cmd) { $zx = $cmd.Source }
+}
+if ([string]::IsNullOrWhiteSpace($zx)) {
+    $portable = Join-Path $RootDir ".build-tools/zxp-4.1.3-x64/ZXPSignCmd.exe"
+    if (Test-Path -LiteralPath $portable) { $zx = (Resolve-Path -LiteralPath $portable).Path }
 }
 if ([string]::IsNullOrWhiteSpace($zx)) {
     throw "ZXPSignCMD not found. Install it and set ZXPSIGN_CMD in $ConfigPath"

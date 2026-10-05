@@ -3,35 +3,37 @@
 
     var API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/";
     var DEFAULT_MODEL_ID = "veo-3.1-generate-preview";
-    var DEFAULT_IMAGE_MODEL_ID = "gemini-3.1-flash-image-preview";
+    var modelPolicy = global.VeoBridgeModelPolicy || null;
+    var DEFAULT_IMAGE_MODEL_ID = modelPolicy ? modelPolicy.DEFAULT_IMAGE_MODEL : "gemini-3.1-flash-image";
     var MODEL_OPTIONS = {
         "veo-3.1-generate-preview": "veo-3.1-generate-preview",
         "veo-3.1-fast-generate-preview": "veo-3.1-fast-generate-preview",
-        "veo-3.1-lite-generate-preview": "veo-3.1-lite-generate-preview",
-        "veo-3.0-generate-001": "veo-3.0-generate-001",
-        "veo-3.0-fast-generate-001": "veo-3.0-fast-generate-001",
-        "veo-2.0-generate-001": "veo-2.0-generate-001"
+        "veo-3.1-lite-generate-preview": "veo-3.1-lite-generate-preview"
     };
     var IMAGE_MODEL_OPTIONS = {
-        "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image-preview",
-        "gemini-2.5-flash-image": "gemini-2.5-flash-image"
+        "gemini-3.1-flash-image": "gemini-3.1-flash-image"
     };
     var DEFAULT_PREDICT_URL = API_BASE_URL + DEFAULT_MODEL_ID + ":predictLongRunning";
     var DEFAULT_IMAGE_GENERATE_URL = API_BASE_URL + DEFAULT_IMAGE_MODEL_ID + ":generateContent";
     var DEFAULT_OPERATION_TIMEOUT_MS = 15 * 60 * 1000;
     var DEFAULT_OPERATION_POLL_INTERVAL_MS = 3000;
     var DEFAULT_MAX_REDIRECTS = 8;
-    var DEFAULT_ALLOW_TEXT_ONLY_FALLBACK = true;
+    var DEFAULT_REQUEST_TIMEOUT_MS = 120000;
     var DEFAULT_VIDEO_MODE = "interpolation";
     var VIDEO_MODE_OPTIONS = {
         "text": "text",
         "image": "image",
         "interpolation": "interpolation",
-        "reference": "reference"
+        "reference": "reference",
+        "extend": "extend"
     };
     var MAX_IMAGE_REFERENCE_INPUTS = 14;
     var MAX_VIDEO_REFERENCE_INPUTS = 3;
     var TINY_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO0hY9sAAAAASUVORK5CYII=";
+    // The predictLongRunning backend is not deployed uniformly. Existing Veo
+    // projects can still require the legacy bytesBase64Encoded wire shape even
+    // when the public Gemini examples show inlineData.
+    var preferredPredictMediaTransport = "bytes";
     var SCRIPT_CHAR_TO_LATIN = {
         272: "D", 273: "d",
         198: "AE", 230: "ae",
@@ -153,7 +155,10 @@
 
     function _normalizeImageModelId(modelId) {
         var id = String(modelId || "").replace(/^\s+|\s+$/g, "");
-        if (!id) {
+        if (modelPolicy) {
+            return modelPolicy.normalizeImageModel(id);
+        }
+        if (!id || id === "gemini-3.1-flash-image-preview") {
             return DEFAULT_IMAGE_MODEL_ID;
         }
         if (IMAGE_MODEL_OPTIONS[id]) {
@@ -210,6 +215,17 @@
         return "720p";
     }
 
+    function _normalizeSeed(value) {
+        if (value === null || typeof value === "undefined" || String(value).replace(/^\s+|\s+$/g, "") === "") {
+            return null;
+        }
+        var parsed = Number(value);
+        if (!isFinite(parsed) || Math.floor(parsed) !== parsed) {
+            throw new Error("seed must be an integer.");
+        }
+        return parsed;
+    }
+
     function _getPredictUrlForModel(modelId) {
         var normalizedModel = _normalizeModelId(modelId);
         return API_BASE_URL + normalizedModel + ":predictLongRunning";
@@ -217,6 +233,9 @@
 
     function _getImageGenerateUrlForModel(modelId) {
         var normalizedModel = _normalizeImageModelId(modelId);
+        if (normalizedModel === "gemini-3.1-flash-image") {
+            return "https://generativelanguage.googleapis.com/v1beta/interactions";
+        }
         return API_BASE_URL + normalizedModel + ":generateContent";
     }
 
@@ -245,18 +264,73 @@
         return text.substring(0, limit) + "...";
     }
 
-    function _createHttpError(statusCode, requestUrl, details) {
+    function _parseRetryDelayMs(headers, errorPayload) {
+        var retryAfter = headers && (headers["retry-after"] || headers["Retry-After"]);
+        var parsed;
+        var dateMs;
+        var detailsList;
+        var i;
+        var delayText;
+        if (retryAfter) {
+            parsed = Number(retryAfter);
+            if (isFinite(parsed) && parsed >= 0) {
+                return Math.round(parsed * 1000);
+            }
+            dateMs = new Date(String(retryAfter)).getTime();
+            if (isFinite(dateMs)) {
+                return Math.max(0, dateMs - new Date().getTime());
+            }
+        }
+        detailsList = errorPayload && errorPayload.details && typeof errorPayload.details.length === "number" ? errorPayload.details : [];
+        for (i = 0; i < detailsList.length; i += 1) {
+            if (!detailsList[i] || !detailsList[i].retryDelay) {
+                continue;
+            }
+            delayText = String(detailsList[i].retryDelay);
+            parsed = parseFloat(delayText);
+            if (isFinite(parsed) && parsed >= 0) {
+                return Math.round(parsed * 1000);
+            }
+        }
+        return null;
+    }
+
+    function _classifyHttpError(statusCode, details, errorPayload, retryAfterMs) {
+        var text = String(details || "");
+        var structured = "";
+        try { structured = JSON.stringify(errorPayload || {}); } catch (ignoreStringifyError) { structured = ""; }
+        if (statusCode === 429) {
+            if (/(exceeded your current quota|check your plan and billing|billing|daily limit|free tier|quota failure|quota.*exhausted)/i.test(text + " " + structured)) {
+                return "QUOTA_EXHAUSTED";
+            }
+            if (retryAfterMs !== null || /(high load|overload|capacity|temporarily unavailable|rate limit|too many requests)/i.test(text + " " + structured)) {
+                return "RATE_LIMIT_TRANSIENT";
+            }
+            return "QUOTA_EXHAUSTED";
+        }
+        if (statusCode === 403 && /(billing|payment|required|quota)/i.test(text + " " + structured)) {
+            return "BILLING_RESTRICTED";
+        }
+        return "HTTP_ERROR";
+    }
+
+    function _createHttpError(statusCode, requestUrl, details, errorPayload, headers) {
         var message = "HTTP " + statusCode + " at " + requestUrl;
         var err;
+        var retryAfterMs = _parseRetryDelayMs(headers || {}, errorPayload || null);
 
         if (details) {
             message += ": " + details;
         }
 
         err = new Error(message);
-        err.code = "HTTP_ERROR";
+        err.code = _classifyHttpError(statusCode, details, errorPayload, retryAfterMs);
         err.statusCode = statusCode;
         err.url = requestUrl;
+        err.errorPayload = errorPayload || null;
+        err.retryAfterMs = retryAfterMs;
+        err.quotaReason = err.code === "QUOTA_EXHAUSTED" || err.code === "BILLING_RESTRICTED" ? details || null : null;
+        err.originalMessage = message;
         if (details) {
             err.details = details;
         }
@@ -274,17 +348,30 @@
         return String(error);
     }
 
-    function _isInlineDataUnsupportedError(error) {
-        var message = _getErrorMessage(error);
-        if (/(inlineData|bytesBase64Encoded)/i.test(message) && /(isn'?t supported|not supported)/i.test(message)) {
-            return true;
-        }
-        return /image-conditioned/i.test(message) && /(not supported|unsupported)/i.test(message);
+    function _normalizeMediaTransport(value) {
+        return String(value || "").toLowerCase() === "inline" ? "inline" : "bytes";
     }
 
-    function _isUnsupportedVideoRequestError(error) {
+    function _isMediaTransportError(error, transport) {
         var message = _getErrorMessage(error);
-        return /Unsupported video generation request/i.test(message);
+        var field = _normalizeMediaTransport(transport) === "inline" ? /inlineData/i : /bytesBase64Encoded/i;
+        var fieldFailure = /(isn['’]?t supported|not supported|unsupported|unknown (?:name|field)|cannot find field|unrecognized field|invalid json payload)/i;
+        return !!(error && error.statusCode === 400 && field.test(message) && fieldFailure.test(message));
+    }
+
+    function _isReferencePlacementError(error) {
+        var message = _getErrorMessage(error);
+        return !!(error && error.statusCode === 400 && /referenceImages/i.test(message) &&
+            /(unknown (?:name|field)|cannot find field|unrecognized field|invalid json payload|unexpected field)/i.test(message));
+    }
+
+    function _isImageFeatureAccessError(error) {
+        var message = _getErrorMessage(error);
+        if (_isMediaTransportError(error, "bytes") || _isMediaTransportError(error, "inline")) {
+            return false;
+        }
+        return /(image-conditioned|image input|reference images?).*(not enabled|permission|allowlist|access denied|not available for (?:this|your) project)/i.test(message) ||
+            /(permission|allowlist|access denied).*(image-conditioned|image input|reference images?)/i.test(message);
     }
 
     function _isProbeImageProcessingError(error) {
@@ -364,6 +451,24 @@
         return String(value);
     }
 
+    function _parseUrl(value) {
+        if (!nodeUrl) {
+            return null;
+        }
+        if (typeof nodeUrl.URL === "function") {
+            return new nodeUrl.URL(value);
+        }
+        // CEP builds based on older Node releases do not expose WHATWG URL.
+        return nodeUrl.parse(value);
+    }
+
+    function _resolveRedirectUrl(baseUrl, location) {
+        if (nodeUrl && typeof nodeUrl.URL === "function") {
+            return new nodeUrl.URL(location, baseUrl).toString();
+        }
+        return nodeUrl.resolve(baseUrl, location);
+    }
+
     function _requestWithRedirect(requestUrl, options, redirectCount) {
         var currentRedirects = typeof redirectCount === "number" ? redirectCount : 0;
         var requestOptions = options || {};
@@ -383,14 +488,14 @@
                 return;
             }
 
-            parsedUrl = nodeUrl.parse(requestUrl);
+            parsedUrl = _parseUrl(requestUrl);
             client = parsedUrl.protocol === "http:" ? http : https;
 
             req = client.request({
                 protocol: parsedUrl.protocol,
                 hostname: parsedUrl.hostname,
                 port: parsedUrl.port,
-                path: parsedUrl.path,
+                path: parsedUrl.path || ((parsedUrl.pathname || "") + (parsedUrl.search || "")),
                 method: requestOptions.method || "GET",
                 headers: requestOptions.headers || {}
             }, function (res) {
@@ -399,13 +504,26 @@
                 var statusCode = res.statusCode || 0;
 
                 if (statusCode >= 300 && statusCode < 400 && locationHeader) {
-                    var nextUrl = nodeUrl.resolve(requestUrl, locationHeader);
+                    var nextUrl = _resolveRedirectUrl(requestUrl, locationHeader);
+                    var nextOptions = requestOptions;
+                    var nextParsedUrl = _parseUrl(nextUrl);
                     if (currentRedirects >= DEFAULT_MAX_REDIRECTS) {
                         reject(new Error("Too many redirects while requesting: " + requestUrl));
                         return;
                     }
 
-                    _requestWithRedirect(nextUrl, requestOptions, currentRedirects + 1)
+                    if (nextParsedUrl.hostname !== parsedUrl.hostname) {
+                        nextOptions = {};
+                        Object.keys(requestOptions).forEach(function (key) { nextOptions[key] = requestOptions[key]; });
+                        nextOptions.headers = {};
+                        Object.keys(requestOptions.headers || {}).forEach(function (headerName) {
+                            var normalizedHeader = String(headerName).toLowerCase();
+                            if (normalizedHeader !== "x-goog-api-key" && normalizedHeader !== "authorization") {
+                                nextOptions.headers[headerName] = requestOptions.headers[headerName];
+                            }
+                        });
+                    }
+                    _requestWithRedirect(nextUrl, nextOptions, currentRedirects + 1)
                         .then(resolve)
                         .catch(reject);
                     return;
@@ -433,6 +551,18 @@
                 reject(error);
             });
 
+            if (typeof req.setTimeout === "function") {
+                req.setTimeout(typeof requestOptions.timeoutMs === "number" ? requestOptions.timeoutMs : DEFAULT_REQUEST_TIMEOUT_MS, function () {
+                    var timeoutError = new Error("Request timed out before the server response was received.");
+                    timeoutError.code = "REQUEST_TIMEOUT";
+                    if (typeof req.destroy === "function") {
+                        req.destroy(timeoutError);
+                    } else {
+                        reject(timeoutError);
+                    }
+                });
+            }
+
             if (requestOptions.body) {
                 req.write(requestOptions.body);
             }
@@ -440,7 +570,7 @@
         });
     }
 
-    function _requestJson(requestUrl, options) {
+    function _requestJsonOnce(requestUrl, options) {
         return _requestWithRedirect(requestUrl, options).then(function (response) {
             var text = response.body && response.body.toString ? response.body.toString("utf8") : String(response.body || "");
             var payload = null;
@@ -467,7 +597,7 @@
                     detailText = _truncate(_collapseWhitespace(text), 320);
                 }
 
-                throw _createHttpError(response.statusCode, requestUrl, detailText);
+                throw _createHttpError(response.statusCode, requestUrl, detailText, errorNode, response.headers || {});
             }
 
             if (!payload) {
@@ -476,6 +606,72 @@
 
             return payload;
         });
+    }
+
+    function _requestJson(requestUrl, options) {
+        var requestOptions = options || {};
+        var method = String(requestOptions.method || "GET").toUpperCase();
+        var maxRetries = typeof requestOptions.maxRetries === "number" ? requestOptions.maxRetries : 3;
+        var attempt = 0;
+
+        function run() {
+            return _requestJsonOnce(requestUrl, requestOptions).catch(function (error) {
+                var status = error && error.statusCode ? error.statusCode : 0;
+                var retryableRateLimit = error && error.code === "RATE_LIMIT_TRANSIENT" &&
+                    (method === "GET" || typeof error.retryAfterMs === "number");
+                var retryableStatus = retryableRateLimit || (method === "GET" && status >= 500 && status <= 599);
+                var retryableNetwork = method === "GET" && !status;
+                var delay;
+                if (attempt >= maxRetries || (!retryableStatus && !retryableNetwork)) { throw error; }
+                attempt += 1;
+                delay = error && typeof error.retryAfterMs === "number"
+                    ? Math.min(30000, Math.max(0, error.retryAfterMs))
+                    : Math.min(8000, 500 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
+                if (typeof requestOptions.onRetry === "function") {
+                    try { requestOptions.onRetry(attempt, delay, error); } catch (ignoreRetryCallback) {}
+                }
+                return _sleep(delay).then(run);
+            });
+        }
+        return run();
+    }
+
+    function _requestDownload(requestUrl, options) {
+        var requestOptions = options || {};
+        var attempt = 0;
+        var maxRetries = typeof requestOptions.maxRetries === "number" ? requestOptions.maxRetries : 3;
+        function run() {
+            return _requestWithRedirect(requestUrl, requestOptions).then(function (response) {
+                var text;
+                var payload = null;
+                var errorNode = null;
+                var detail;
+                if (response.statusCode >= 200 && response.statusCode < 300) {
+                    return response;
+                }
+                text = response.body && response.body.toString ? response.body.toString("utf8") : String(response.body || "");
+                try { payload = text ? JSON.parse(text) : null; } catch (parseError) { payload = null; }
+                errorNode = payload && payload.error ? payload.error : null;
+                detail = errorNode && errorNode.message ? errorNode.message : (text ? _truncate(_collapseWhitespace(text), 320) : "Download endpoint returned non-success status.");
+                throw _createHttpError(response.statusCode, requestUrl, detail, errorNode, response.headers || {});
+            }).catch(function (error) {
+                var status = error && error.statusCode ? error.statusCode : 0;
+                var retryable = !status || status >= 500 || (error && error.code === "RATE_LIMIT_TRANSIENT");
+                var delay;
+                if (!retryable || attempt >= maxRetries) {
+                    throw error;
+                }
+                attempt += 1;
+                delay = error && typeof error.retryAfterMs === "number"
+                    ? Math.min(30000, Math.max(0, error.retryAfterMs))
+                    : Math.min(8000, 500 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
+                if (typeof requestOptions.onRetry === "function") {
+                    try { requestOptions.onRetry(attempt, delay, error); } catch (ignoreRetryCallback) {}
+                }
+                return _sleep(delay).then(run);
+            });
+        }
+        return run();
     }
 
     function _extractVersionBase(predictUrl) {
@@ -487,7 +683,7 @@
             return null;
         }
 
-        parsed = nodeUrl.parse(predictUrl);
+        parsed = _parseUrl(predictUrl);
         if (!parsed || !parsed.protocol || !parsed.host) {
             return null;
         }
@@ -714,7 +910,7 @@
         }
 
         try {
-            parsed = nodeUrl.parse(fileUrl);
+            parsed = _parseUrl(fileUrl);
             pathname = parsed.pathname || "";
             base = path.basename(pathname);
             if (!base) {
@@ -996,11 +1192,27 @@
         return _safeFileName(_buildMediaFileStem(options || {}) + extension);
     }
 
-    function _buildPredictImagePayload(base64Data, mimeType) {
+    function _buildPredictMediaPayload(base64Data, mimeType, transport) {
+        if (_normalizeMediaTransport(transport) === "inline") {
+            return {
+                inlineData: {
+                    data: String(base64Data || ""),
+                    mimeType: String(mimeType || "application/octet-stream")
+                }
+            };
+        }
         return {
             bytesBase64Encoded: String(base64Data || ""),
-            mimeType: String(mimeType || "image/png")
+            mimeType: String(mimeType || "application/octet-stream")
         };
+    }
+
+    function _buildPredictImagePayload(base64Data, mimeType, transport) {
+        return _buildPredictMediaPayload(base64Data, mimeType || "image/png", transport);
+    }
+
+    function _buildPredictVideoPayload(base64Data, mimeType, transport) {
+        return _buildPredictMediaPayload(base64Data, mimeType || "video/mp4", transport);
     }
 
     function _buildPredictRequestBody(input) {
@@ -1015,6 +1227,7 @@
         var hasResolution = input.resolution !== undefined && input.resolution !== null && String(input.resolution) !== "";
         var normalizedDuration = hasDuration ? _normalizeDurationSeconds(input.durationSeconds) : null;
         var normalizedResolution = hasResolution ? _normalizeResolution(input.resolution) : "";
+        var mediaTransport = _normalizeMediaTransport(input.mediaTransport);
         var i;
         var refItem;
 
@@ -1026,13 +1239,16 @@
         if (hasResolution) {
             body.parameters.resolution = normalizedResolution;
         }
+        if (input.seed !== null && typeof input.seed !== "undefined") {
+            body.parameters.seed = _normalizeSeed(input.seed);
+        }
 
         if ((mode === "image" || mode === "interpolation") && input.startImageBase64) {
-            body.instances[0].image = _buildPredictImagePayload(input.startImageBase64, input.mimeType);
+            body.instances[0].image = _buildPredictImagePayload(input.startImageBase64, input.mimeType, mediaTransport);
         }
 
         if (mode === "interpolation" && input.endImageBase64) {
-            body.instances[0].lastFrame = _buildPredictImagePayload(input.endImageBase64, input.mimeType);
+            body.instances[0].lastFrame = _buildPredictImagePayload(input.endImageBase64, input.mimeType, mediaTransport);
         }
 
         if (mode === "reference" && input.references && input.references.length) {
@@ -1047,17 +1263,25 @@
             for (i = 0; i < input.references.length; i += 1) {
                 refItem = input.references[i];
                 referenceTarget.push({
-                    image: _buildPredictImagePayload(refItem.data, refItem.mimeType),
+                    image: _buildPredictImagePayload(refItem.data, refItem.mimeType, mediaTransport),
                     referenceType: "asset"
                 });
             }
+        }
+
+        if (mode === "extend" && input.sourceVideoBase64) {
+            body.instances[0].video = _buildPredictVideoPayload(input.sourceVideoBase64, "video/mp4", mediaTransport);
+            body.parameters.durationSeconds = 8;
+            body.parameters.resolution = "720p";
         }
 
         if (hasDuration && (mode === "reference" || normalizedResolution === "1080p" || normalizedResolution === "4k")) {
             body.parameters.durationSeconds = 8;
         }
 
-        if (mode !== "text") {
+        if (mode === "extend") {
+            body.parameters.personGeneration = "allow_all";
+        } else if (mode !== "text") {
             // Per Veo docs, image-based generation requires this value.
             body.parameters.personGeneration = "allow_adult";
         }
@@ -1116,6 +1340,28 @@
         return body;
     }
 
+    function _buildImageInteractionRequestBody(input) {
+        var interactionInput = [{ type: "text", text: input.prompt }];
+        var i;
+        for (i = 0; i < input.references.length; i += 1) {
+            interactionInput.push({
+                type: "image",
+                mime_type: input.references[i].mimeType,
+                data: input.references[i].data
+            });
+        }
+        return {
+            model: "gemini-3.1-flash-image",
+            input: interactionInput,
+            response_format: {
+                type: "image",
+                mime_type: "image/jpeg",
+                aspect_ratio: _normalizeImageAspectRatio(input.aspectRatio),
+                image_size: _normalizeImageSize(input.imageSize)
+            }
+        };
+    }
+
     function _collectInlineImages(node, results) {
         var key;
         var value;
@@ -1145,6 +1391,10 @@
                     data: node.inlineData.data
                 });
             }
+        }
+
+        if (typeof node.data === "string" && (node.mime_type || node.mimeType) && String(node.mime_type || node.mimeType).toLowerCase().indexOf("image/") === 0) {
+            results.push({ mimeType: node.mime_type || node.mimeType, data: node.data });
         }
 
         for (key in node) {
@@ -1275,19 +1525,11 @@
             responseHeaders["x-goog-api-key"] = apiKey;
         }
 
-        return _requestWithRedirect(videoUri, {
+        return _requestDownload(videoUri, {
             method: "GET",
-            headers: responseHeaders
+            headers: responseHeaders,
+            onRetry: namingOptions && typeof namingOptions.onRetry === "function" ? namingOptions.onRetry : null
         }).then(function (response) {
-            var text;
-            var detail;
-
-            if (response.statusCode < 200 || response.statusCode >= 300) {
-                text = response.body && response.body.toString ? response.body.toString("utf8") : "";
-                detail = text ? _truncate(_collapseWhitespace(text), 320) : "Download endpoint returned non-success status.";
-                throw _createHttpError(response.statusCode, videoUri, detail);
-            }
-
             fs.writeFileSync(finalPath, response.body);
             return finalPath;
         });
@@ -1359,6 +1601,7 @@
         var startShotPath = options.startShotPath;
         var endShotPath = options.endShotPath;
         var refsList = options.referenceImages || [];
+        var sourceVideoPath = options.sourceVideoPath || "";
         var modelId = _normalizeModelId(options.modelId || DEFAULT_MODEL_ID);
         var predictUrl = options.predictUrl || _getPredictUrlForModel(modelId);
         var pollIntervalMs = typeof options.pollIntervalMs === "number" ? options.pollIntervalMs : DEFAULT_OPERATION_POLL_INTERVAL_MS;
@@ -1367,7 +1610,6 @@
         var mimeType = options.mimeType || _guessImageMimeTypeFromPath(startShotPath || endShotPath || "");
         var aspectRatio = _normalizeAspectRatio(options.aspectRatio || "16:9");
         var preferredVideosDir = options.videosDir ? String(options.videosDir) : "";
-        var allowTextOnlyFallback = options.allowTextOnlyFallback;
         var emitStatus = typeof options.onStatus === "function" ? options.onStatus : function () {};
         var emitOperation = typeof options.onOperation === "function" ? options.onOperation : function () {};
         var resumeOperationName = options.resumeOperationName || options.operationName || null;
@@ -1378,14 +1620,14 @@
         var operationUrl = null;
         var lastOperationPayload = null;
         var requestMode = mode;
+        var requestTransport = options.requestTransport ? _normalizeMediaTransport(options.requestTransport) : null;
+        var referencePlacement = options.referencePlacement === "parameters" ? "parameters" : "instances";
         var fallbackReason = null;
+        var compatibilityFallbackError = null;
         var stage = "Uploading";
         var normalizedRefs = [];
         var hasResumeOperation = false;
-
-        if (typeof allowTextOnlyFallback !== "boolean") {
-            allowTextOnlyFallback = false;
-        }
+        var requestAttemptCount = parseInt(options.attemptCount, 10) || 0;
 
         if (!apiKey || !String(apiKey).replace(/^\s+|\s+$/g, "")) {
             return Promise.reject(new Error("API key is required."));
@@ -1425,6 +1667,14 @@
                     return Promise.reject(new Error("Too many reference images. Limit is " + MAX_VIDEO_REFERENCE_INPUTS + "."));
                 }
             }
+            if (mode === "extend") {
+                if (!sourceVideoPath) {
+                    return Promise.reject(new Error("sourceVideoPath is required for extend mode."));
+                }
+                if (!/\.mp4$/i.test(sourceVideoPath)) {
+                    return Promise.reject(new Error("Extend requires an MP4 source video."));
+                }
+            }
         }
 
         postHeaders = {
@@ -1439,7 +1689,10 @@
                     operationUrl: operationUrl || null,
                     mode: mode,
                     requestMode: requestMode || mode,
-                    fallbackReason: fallbackReason || null
+                    requestTransport: requestTransport,
+                    referencePlacement: referencePlacement,
+                    fallbackReason: fallbackReason || null,
+                    attemptCount: requestAttemptCount
                 });
             } catch (operationCallbackError) {
                 // ignore callback errors
@@ -1448,6 +1701,11 @@
 
         function pollOperation() {
             var elapsedMs = new Date().getTime() - startTime;
+            if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
+                var cancelledError = new Error("Polling paused by user.");
+                cancelledError.cancelled = true;
+                throw cancelledError;
+            }
             if (elapsedMs > timeoutMs) {
                 throw new Error("Operation timed out after " + timeoutMs + "ms.");
             }
@@ -1456,6 +1714,9 @@
                 method: "GET",
                 headers: {
                     "x-goog-api-key": apiKey
+                },
+                onRetry: function (attempt, delay) {
+                    emitStatus("Retrying", { attemptCount: attempt, retryDelayMs: delay, progressPercent: 40 });
                 }
             }).then(function (operationPayload) {
                 var operationError;
@@ -1473,6 +1734,9 @@
 
                 if (operationPayload.error) {
                     operationError = operationPayload.error.message || JSON.stringify(operationPayload.error);
+                    if (operationPayload.error.code) {
+                        throw _createHttpError(parseInt(operationPayload.error.code, 10) || 500, operationUrl, operationError, operationPayload.error, {});
+                    }
                     throw new Error("Operation failed: " + operationError);
                 }
 
@@ -1491,7 +1755,10 @@
                     aspectRatio: aspectRatio,
                     sampleIndex: options.sampleIndex || 1,
                     sampleCount: options.sampleCount || 1,
-                    modelId: modelId
+                    modelId: modelId,
+                    onRetry: function (attempt, delay) {
+                        emitStatus("Retrying download", { attemptCount: attempt, retryDelayMs: delay, progressPercent: 96 });
+                    }
                 }).then(function (downloadedPath) {
                     return {
                         downloadedPath: downloadedPath,
@@ -1500,7 +1767,10 @@
                         operationUrl: operationUrl,
                         mode: mode,
                         requestMode: requestMode,
+                        requestTransport: requestTransport,
+                        referencePlacement: referencePlacement,
                         fallbackReason: fallbackReason,
+                        attemptCount: requestAttemptCount,
                         operation: lastOperationPayload
                     };
                 });
@@ -1519,6 +1789,12 @@
             }
             if (options.fallbackReason) {
                 fallbackReason = String(options.fallbackReason);
+            }
+            if (options.requestTransport) {
+                requestTransport = _normalizeMediaTransport(options.requestTransport);
+            }
+            if (options.referencePlacement === "parameters") {
+                referencePlacement = "parameters";
             }
 
             stage = "Polling";
@@ -1575,109 +1851,160 @@
             return chain;
         }
 
-        function postPredict(startBase64, endBase64, extra) {
-            var opts = extra || {};
-            var body = _buildPredictRequestBody({
-                mode: mode,
-                prompt: prompt,
-                mimeType: mimeType,
-                aspectRatio: aspectRatio,
-                durationSeconds: options.durationSeconds,
-                resolution: options.resolution,
-                startImageBase64: startBase64,
-                endImageBase64: endBase64,
-                references: normalizedRefs,
-                referenceInParameters: !!opts.referenceInParameters
-            });
+        function postPredict(startBase64, endBase64, sourceVideoBase64) {
+            var hasMediaInput = mode !== "text";
+            var initialTransport = hasMediaInput
+                ? _normalizeMediaTransport(requestTransport || preferredPredictMediaTransport)
+                : "bytes";
+            var initialPlacement = mode === "reference" && referencePlacement === "parameters" ? "parameters" : "instances";
+            var attempted = {};
 
-            return _requestJson(predictUrl, {
-                method: "POST",
-                headers: postHeaders,
-                body: _bufferFromString(JSON.stringify(body))
-            }).then(function (operationResponse) {
-                requestMode = mode;
-                fallbackReason = null;
-                return operationResponse;
-            }, function (uploadError) {
-                var textOnlyBody;
-                var fallbackReferenceBody;
-                var canTryReferencePlacementFallback = mode === "reference" &&
-                    !opts.referenceInParameters &&
-                    (_isUnsupportedVideoRequestError(uploadError) || /referenceImages/i.test(_getErrorMessage(uploadError)));
-                var shouldFallback = allowTextOnlyFallback &&
-                    mode !== "text" &&
-                    (_isInlineDataUnsupportedError(uploadError) || _isUnsupportedVideoRequestError(uploadError));
+            function send(transport, placement) {
+                var normalizedTransport = _normalizeMediaTransport(transport);
+                var normalizedPlacement = placement === "parameters" ? "parameters" : "instances";
+                var attemptKey = normalizedTransport + ":" + normalizedPlacement;
+                var body;
+                var sendBaseAttempt;
 
-                if (canTryReferencePlacementFallback) {
-                    emitStatus("Uploading (reference format fallback)", {
-                        progressPercent: 12
-                    });
-                    fallbackReferenceBody = _buildPredictRequestBody({
-                        mode: mode,
-                        prompt: prompt,
-                        mimeType: mimeType,
-                        aspectRatio: aspectRatio,
-                        startImageBase64: startBase64,
-                        endImageBase64: endBase64,
-                        references: normalizedRefs,
-                        referenceInParameters: true
-                    });
-                    return _requestJson(predictUrl, {
-                        method: "POST",
-                        headers: postHeaders,
-                        body: _bufferFromString(JSON.stringify(fallbackReferenceBody))
-                    }).then(function (fallbackResponse) {
-                        requestMode = "reference_fallback_parameters";
-                        fallbackReason = _getErrorMessage(uploadError);
-                        return fallbackResponse;
-                    });
+                attempted[attemptKey] = true;
+                if (hasMediaInput) {
+                    requestTransport = normalizedTransport;
+                }
+                if (mode === "reference") {
+                    referencePlacement = normalizedPlacement;
                 }
 
-                if (!shouldFallback) {
-                    throw uploadError;
-                }
-
-                requestMode = "text_only_fallback";
-                fallbackReason = _getErrorMessage(uploadError);
-                emitStatus("Uploading (text-only fallback)", {
-                    progressPercent: 12
-                });
-
-                textOnlyBody = _buildPredictRequestBody({
-                    mode: "text",
+                body = _buildPredictRequestBody({
+                    mode: mode,
                     prompt: prompt,
+                    mimeType: mimeType,
                     aspectRatio: aspectRatio,
                     durationSeconds: options.durationSeconds,
-                    resolution: options.resolution
+                    resolution: options.resolution,
+                    seed: options.seed,
+                    startImageBase64: startBase64,
+                    endImageBase64: endBase64,
+                    references: normalizedRefs,
+                    sourceVideoBase64: sourceVideoBase64 || null,
+                    mediaTransport: normalizedTransport,
+                    referenceInParameters: mode === "reference" && normalizedPlacement === "parameters"
                 });
+                requestAttemptCount += 1;
+                sendBaseAttempt = requestAttemptCount;
 
                 return _requestJson(predictUrl, {
                     method: "POST",
                     headers: postHeaders,
-                    body: _bufferFromString(JSON.stringify(textOnlyBody))
+                    body: _bufferFromString(JSON.stringify(body)),
+                    maxRetries: 2,
+                    onRetry: function (attempt, delay, retryError) {
+                        requestAttemptCount = Math.max(requestAttemptCount, sendBaseAttempt + attempt);
+                        emitStatus("Retrying", {
+                            attemptCount: requestAttemptCount,
+                            retryDelayMs: delay,
+                            statusCode: retryError && retryError.statusCode ? retryError.statusCode : null,
+                            progressPercent: 10
+                        });
+                    }
+                }).then(function (operationResponse) {
+                    requestMode = mode;
+                    if (hasMediaInput) {
+                        preferredPredictMediaTransport = normalizedTransport;
+                    }
+                    if (compatibilityFallbackError) {
+                        fallbackReason = _getErrorMessage(compatibilityFallbackError);
+                    }
+                    return operationResponse;
+                }, function (uploadError) {
+                    var alternateTransport;
+                    var alternateKey;
+
+                    uploadError.requestTransport = normalizedTransport;
+                    uploadError.referencePlacement = normalizedPlacement;
+
+                    if ((!uploadError.statusCode || uploadError.statusCode >= 500) && uploadError.code !== "RATE_LIMIT_TRANSIENT") {
+                        uploadError.code = "POST_ACCEPTANCE_UNKNOWN";
+                        uploadError.originalMessage = uploadError.originalMessage || uploadError.message;
+                    }
+
+                    if (_isMediaTransportError(uploadError, normalizedTransport)) {
+                        alternateTransport = normalizedTransport === "bytes" ? "inline" : "bytes";
+                        alternateKey = alternateTransport + ":" + normalizedPlacement;
+                        if (!attempted[alternateKey]) {
+                            compatibilityFallbackError = compatibilityFallbackError || uploadError;
+                            emitStatus("Uploading (media format compatibility)", {
+                                progressPercent: 12,
+                                requestTransport: alternateTransport
+                            });
+                            return send(alternateTransport, normalizedPlacement);
+                        }
+                    }
+
+                    if (mode === "reference" && normalizedPlacement === "instances" && _isReferencePlacementError(uploadError)) {
+                        alternateKey = normalizedTransport + ":parameters";
+                        if (!attempted[alternateKey]) {
+                            compatibilityFallbackError = compatibilityFallbackError || uploadError;
+                            emitStatus("Uploading (reference placement compatibility)", {
+                                progressPercent: 12,
+                                requestTransport: normalizedTransport
+                            });
+                            return send(normalizedTransport, "parameters");
+                        }
+                    }
+
+                    throw uploadError;
                 });
-            });
+            }
+
+            return send(initialTransport, initialPlacement);
         }
 
         function buildRequestAndPost() {
             if (mode === "text") {
-                return postPredict(null, null);
+                return postPredict(null, null, null);
             }
             if (mode === "reference") {
                 return buildRefs().then(function () {
-                    return postPredict(null, null);
+                    return postPredict(null, null, null);
                 });
+            }
+            if (mode === "extend") {
+                if (!fs) {
+                    return Promise.reject(new Error("Node fs is unavailable for video extension."));
+                }
+                try {
+                    var sourceStats = fs.statSync(sourceVideoPath);
+                    if (!sourceStats.isFile()) {
+                        return Promise.reject(new Error("Source video is not a file: " + sourceVideoPath));
+                    }
+                    if (sourceStats.size > 200 * 1024 * 1024) {
+                        return Promise.reject(new Error("Source video is too large for CEP inline upload (200 MB limit)."));
+                    }
+                    if (sourceStats.size > 100 * 1024 * 1024) {
+                        emitStatus("Uploading large source video", { sourceSizeBytes: sourceStats.size, progressPercent: 6 });
+                    }
+                    var sourceVideoBase64 = fs.readFileSync(sourceVideoPath).toString("base64");
+                    return postPredict(null, null, sourceVideoBase64).then(function (result) {
+                        sourceVideoBase64 = null;
+                        return result;
+                    }, function (error) {
+                        sourceVideoBase64 = null;
+                        throw error;
+                    });
+                } catch (sourceError) {
+                    return Promise.reject(new Error("Unable to read source video: " + sourceError.message));
+                }
             }
             if (mode === "image") {
                 return downscaleToBase64(startShotPath, 1080, mimeType).then(function (startBase64) {
-                    return postPredict(startBase64, null);
+                    return postPredict(startBase64, null, null);
                 });
             }
             return downscaleToBase64(startShotPath, 1080, mimeType)
                 .then(function (startBase64) {
                     return downscaleToBase64(endShotPath, 1080, mimeType)
                         .then(function (endBase64) {
-                            return postPredict(startBase64, endBase64);
+                            return postPredict(startBase64, endBase64, null);
                         });
                 });
         }
@@ -1685,7 +2012,10 @@
             .then(function (operationResponse) {
                 operationName = operationResponse.name || operationResponse.operation || null;
                 if (!operationName) {
-                    throw new Error("predictLongRunning did not return operation name.");
+                    var missingOperationError = new Error("predictLongRunning returned success without an operation name. Google may still have accepted the request.");
+                    missingOperationError.code = "POST_ACCEPTANCE_UNKNOWN";
+                    missingOperationError.originalMessage = missingOperationError.message;
+                    throw missingOperationError;
                 }
 
                 operationUrl = _resolveOperationUrl(predictUrl, operationName);
@@ -1700,14 +2030,21 @@
                 return result;
             }, function (error) {
                 var message = error && error.message ? error.message : String(error);
+                var originalMessage = message;
+                var wrappedError;
+                var errorCode = error && error.code ? error.code : "VIDEO_GENERATION_ERROR";
                 if (/(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|ECONNRESET|socket hang up)/i.test(message)) {
                     message = "Network error while contacting Gemini API. Check internet/VPN/firewall and retry.";
                 }
                 if (/lastFrame/i.test(message) && /(isn'?t supported|not supported)/i.test(message)) {
                     message = "Model doesn't support lastFrame. Switch to Veo 3.1 endpoint.";
                 }
-                if (/(inlineData|bytesBase64Encoded)/i.test(message) && /(isn'?t supported|not supported)/i.test(message)) {
-                    message = "Your key/project doesn't support image-conditioned mode (first/last/reference images) for this model. Use Text mode or request Veo 3.1 image input access.";
+                if (compatibilityFallbackError && _isMediaTransportError(error, requestTransport)) {
+                    errorCode = "MEDIA_TRANSPORT_UNSUPPORTED";
+                    message = "Gemini rejected both supported media payload formats. Google response: " + originalMessage;
+                } else if (_isImageFeatureAccessError(error)) {
+                    errorCode = "IMAGE_INPUT_ACCESS_DENIED";
+                    message = "This Google project is not enabled for image-conditioned Veo input. Google response: " + originalMessage;
                 }
                 if (/Unsupported video generation request/i.test(message)) {
                     message = "Unsupported video generation request. Verify Veo 3.1 endpoint and mode-specific fields (image/lastFrame/referenceImages).";
@@ -1715,19 +2052,32 @@
                 if (/referenceImages\.style/i.test(message) || (/referenceType/i.test(message) && /style/i.test(message))) {
                     message = "Veo 3.1 reference mode supports only referenceType='asset'. Remove style references or switch model.";
                 }
-                if (/referenceImages/i.test(message) && /(isn'?t supported|not supported)/i.test(message)) {
-                    message = "Model/key doesn't support referenceImages for this endpoint. Try Image/Interpolation mode or use a project with reference image access.";
-                }
                 if (/HTTP 401/i.test(message)) {
                     message = "Unauthorized (401). Check API key value in Settings.";
                 }
                 if (/HTTP 403/i.test(message)) {
                     message = "Forbidden (403). API key/project has no access to this model or method.";
                 }
-                if (/HTTP 429/i.test(message)) {
-                    message = "Rate limit reached (429). Wait and retry or reduce sample count.";
+                if (errorCode === "QUOTA_EXHAUSTED") {
+                    message = "Quota exhausted (429). " + (error && error.details ? String(error.details) : originalMessage);
+                } else if (errorCode === "RATE_LIMIT_TRANSIENT") {
+                    message = "Temporary rate limit (429). " + (error && error.details ? String(error.details) : originalMessage);
+                } else if (errorCode === "POST_ACCEPTANCE_UNKNOWN") {
+                    message = "The submission response was interrupted, so it is unknown whether Google accepted the request. It was not sent again automatically.";
                 }
-                throw new Error(stage + " failed: " + message);
+                wrappedError = new Error(stage + " failed: " + message);
+                wrappedError.code = errorCode;
+                wrappedError.statusCode = error && error.statusCode ? error.statusCode : null;
+                wrappedError.details = error && error.details ? error.details : null;
+                wrappedError.originalMessage = error && error.originalMessage ? error.originalMessage : originalMessage;
+                wrappedError.requestTransport = error && error.requestTransport ? error.requestTransport : requestTransport;
+                wrappedError.referencePlacement = error && error.referencePlacement ? error.referencePlacement : referencePlacement;
+                wrappedError.cancelled = !!(error && error.cancelled);
+                wrappedError.errorPayload = error && error.errorPayload ? error.errorPayload : null;
+                wrappedError.retryAfterMs = error && typeof error.retryAfterMs === "number" ? error.retryAfterMs : null;
+                wrappedError.quotaReason = error && error.quotaReason ? error.quotaReason : null;
+                wrappedError.attemptCount = requestAttemptCount;
+                throw wrappedError;
             });
     }
 
@@ -1737,8 +2087,7 @@
         var modelId = _normalizeModelId(options.modelId || DEFAULT_MODEL_ID);
         var predictUrl = options.predictUrl || _getPredictUrlForModel(modelId);
         var headers;
-        var textBody;
-        var inlineBody;
+        var modelInfoUrl;
 
         if (!apiKey || !String(apiKey).replace(/^\s+|\s+$/g, "")) {
             return Promise.reject(new Error("API key is required."));
@@ -1752,60 +2101,18 @@
             "x-goog-api-key": apiKey
         };
 
-        textBody = _buildPredictRequestBody({
-            mode: "text",
-            prompt: "capability probe",
-            aspectRatio: "16:9"
-        });
-
-        inlineBody = _buildPredictRequestBody({
-            mode: "interpolation",
-            prompt: "capability probe",
-            mimeType: "image/png",
-            aspectRatio: "16:9",
-            startImageBase64: TINY_PNG_BASE64,
-            endImageBase64: TINY_PNG_BASE64
-        });
-
-        return _requestJson(predictUrl, {
-            method: "POST",
-            headers: headers,
-            body: _bufferFromString(JSON.stringify(textBody))
+        modelInfoUrl = API_BASE_URL + modelId;
+        return _requestJson(modelInfoUrl, {
+            method: "GET",
+            headers: headers
         }).then(function () {
-            return _requestJson(predictUrl, {
-                method: "POST",
-                headers: headers,
-                body: _bufferFromString(JSON.stringify(inlineBody))
-            }).then(function () {
-                return {
-                    ok: true,
-                    textToVideo: true,
-                    inlineData: true,
-                    modelId: modelId
-                };
-            }, function (inlineError) {
-                var inlineMessage = _getErrorMessage(inlineError);
-                if (_isInlineDataUnsupportedError(inlineError) || _isUnsupportedVideoRequestError(inlineError)) {
-                    return {
-                        ok: true,
-                        textToVideo: true,
-                        inlineData: false,
-                        modelId: modelId,
-                        reason: inlineMessage
-                    };
-                }
-                if (_isProbeImageProcessingError(inlineError)) {
-                    return {
-                        ok: true,
-                        textToVideo: true,
-                        inlineData: true,
-                        modelId: modelId,
-                        probeInconclusive: true,
-                        reason: inlineMessage
-                    };
-                }
-                throw inlineError;
-            });
+            return {
+                ok: true,
+                textToVideo: true,
+                inlineData: true,
+                modelId: modelId,
+                metadataOnly: true
+            };
         });
     }
 
@@ -1890,12 +2197,22 @@
             };
 
             function send(includeImageConfig, includeImageSize) {
+                var useInteractions = modelId === "gemini-3.1-flash-image";
                 var body = _buildImageGenerateRequestBody({
                     prompt: prompt,
                     references: normalizedRefs,
                     aspectRatio: aspectRatio,
                     imageSize: imageSize
                 }, includeImageConfig, includeImageSize);
+
+                if (useInteractions) {
+                    body = _buildImageInteractionRequestBody({
+                        prompt: prompt,
+                        references: normalizedRefs,
+                        aspectRatio: aspectRatio,
+                        imageSize: imageSize
+                    });
+                }
 
                 return _requestJson(requestUrl, {
                     method: "POST",
@@ -1912,6 +2229,7 @@
             return send(true, true).then(function (payload) {
                 return payload;
             }, function (firstError) {
+                if (modelId === "gemini-3.1-flash-image") { throw firstError; }
                 var firstMessage = _getErrorMessage(firstError);
                 if (!/imageConfig|imageSize|Unsupported|INVALID_ARGUMENT/i.test(firstMessage)) {
                     throw firstError;
@@ -2011,6 +2329,23 @@
         MODEL_OPTIONS: MODEL_OPTIONS,
         IMAGE_MODEL_OPTIONS: IMAGE_MODEL_OPTIONS,
         getPredictUrlForModel: _getPredictUrlForModel,
-        getImageGenerateUrlForModel: _getImageGenerateUrlForModel
+        getImageGenerateUrlForModel: _getImageGenerateUrlForModel,
+        validateVideoOptions: function (options) {
+            return modelPolicy && typeof modelPolicy.getVideoConstraints === "function"
+                ? modelPolicy.getVideoConstraints(options || {})
+                : null;
+        },
+        _testBuildPredictRequestBody: _buildPredictRequestBody,
+        _testIsMediaTransportError: _isMediaTransportError,
+        _testIsReferencePlacementError: _isReferencePlacementError,
+        _testIsImageFeatureAccessError: _isImageFeatureAccessError,
+        _testCreateHttpError: _createHttpError,
+        _testRequestJson: _requestJson,
+        _testSetPreferredPredictMediaTransport: function (value) {
+            preferredPredictMediaTransport = _normalizeMediaTransport(value);
+        },
+        _testBuildImageGenerateRequestBody: _buildImageGenerateRequestBody,
+        _testBuildImageInteractionRequestBody: _buildImageInteractionRequestBody,
+        _testExtractImageInlineData: _extractImageInlineData
     };
 }(window));

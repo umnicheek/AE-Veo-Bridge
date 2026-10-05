@@ -1,3 +1,5 @@
 .certs/
+.build-tools/
+.msi-build/
 .zxp-stage/
 dist/

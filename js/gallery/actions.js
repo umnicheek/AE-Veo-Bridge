@@ -26,6 +26,40 @@
         }
     }
 
+    function _redactSecrets(value) {
+        var clone = _cloneJson(value, value);
+        function visit(node) {
+            var key;
+            var i;
+            if (!node || typeof node !== "object") { return; }
+            if (node instanceof Array) {
+                for (i = 0; i < node.length; i += 1) {
+                    if (typeof node[i] === "string" && /AIza[0-9A-Za-z_-]{20,}/.test(node[i])) { node[i] = "[REDACTED]"; }
+                    else { visit(node[i]); }
+                }
+                return;
+            }
+            for (key in node) {
+                if (!node.hasOwnProperty(key)) { continue; }
+                if (/(api.?key|authorization|password|secret|access.?token|refresh.?token)/i.test(key)) {
+                    node[key] = "[REDACTED]";
+                } else if (typeof node[key] === "string" && /AIza[0-9A-Za-z_-]{20,}/.test(node[key])) {
+                    node[key] = node[key].replace(/AIza[0-9A-Za-z_-]{20,}/g, "[REDACTED]");
+                } else {
+                    visit(node[key]);
+                }
+            }
+        }
+        visit(clone);
+        return clone;
+    }
+
+    function _redactSecretText(value) {
+        return String(value || "")
+            .replace(/AIza[0-9A-Za-z_-]{20,}/g, "[REDACTED]")
+            .replace(/("?(?:api.?key|authorization|password|secret|access.?token|refresh.?token)"?\s*:\s*")[^"]*(")/gi, "$1[REDACTED]$2");
+    }
+
     function _timestampTag() {
         var now = new Date();
         function pad2(value) {
@@ -193,6 +227,7 @@
         var getLoadedSettings = typeof opts.getLoadedSettings === "function" ? opts.getLoadedSettings : function () { return null; };
         var getHostPaths = typeof opts.getHostPaths === "function" ? opts.getHostPaths : function () { return null; };
         var revealPathInExplorer = typeof opts.revealPathInExplorer === "function" ? opts.revealPathInExplorer : null;
+        var runtimeBuildId = String(opts.runtimeBuildId || "unknown");
         var fs = _safeRequire("fs");
         var path = _safeRequire("path");
         var os = _safeRequire("os");
@@ -365,13 +400,14 @@
                     }
                 }
 
-                settingsSnapshot = _cloneJson(getLoadedSettings() || {}, {});
+                settingsSnapshot = _redactSecrets(getLoadedSettings() || {});
                 envSnapshot = _buildEnvironmentSnapshot();
                 queueSummary = buildQueueSummary(stateSnapshot);
                 manifest = {
                     name: "VeoBridge Diagnostics",
                     createdAt: createdAt,
-                    version: "1.0.0",
+                    version: "0.4.1",
+                    runtimeBuildId: runtimeBuildId,
                     includes: [
                         "manifest.json",
                         "environment.json",
@@ -389,14 +425,14 @@
                     hostPaths: _cloneJson(getHostPaths() || null, null)
                 });
                 _writeJson(fs, path.join(stagingDir, "settings.json"), settingsSnapshot);
-                _writeJson(fs, path.join(stagingDir, "state.snapshot.json"), _cloneJson(stateSnapshot, null));
+                _writeJson(fs, path.join(stagingDir, "state.snapshot.json"), _redactSecrets(stateSnapshot));
                 _writeJson(fs, path.join(stagingDir, "state.raw.json"), {
-                    rawText: rawState || "",
-                    parsed: parsedRawState
+                    rawText: _redactSecretText(rawState),
+                    parsed: _redactSecrets(parsedRawState)
                 });
                 _writeJson(fs, path.join(stagingDir, "queue.summary.json"), _cloneJson(queueSummary, null));
                 _writeJson(fs, path.join(stagingDir, "logs.json"), {
-                    logs: getRecentLogs()
+                    logs: _redactSecrets(getRecentLogs())
                 });
             } catch (writeError) {
                 _removeDirRecursive(fs, path, stagingDir);
@@ -474,6 +510,8 @@
     }
 
     global.VeoBridgeGalleryModules.actions = {
-        create: create
+        create: create,
+        _testRedactSecrets: _redactSecrets,
+        _testRedactSecretText: _redactSecretText
     };
 }(window));

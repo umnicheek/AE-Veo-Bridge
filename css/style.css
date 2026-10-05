@@ -2384,6 +2384,10 @@ body.gallery-flow {
     grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
+.gallery-flow .flow-options-grid.six {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .gallery-flow .flow-opt {
     display: flex;
     flex-direction: column;
@@ -2855,6 +2859,7 @@ body.gallery-flow {
         flex-wrap: wrap;
     }
 
+    .gallery-flow .flow-options-grid.six,
     .gallery-flow .flow-options-grid.five,
     .gallery-flow .flow-options-grid.four,
     .gallery-flow .flow-options-grid.three {

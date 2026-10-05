@@ -3,9 +3,13 @@
 
     var POLL_INTERVAL_MS = 750;
     var STATE_VERSION_NONE = 0;
-    var LATEST_STATE_VERSION = 3;
+    var LATEST_STATE_VERSION = 8;
+    var STATE_WRITE_LOCK_STALE_MS = 5000;
+    var STATE_WRITE_LOCK_ATTEMPTS = 30;
+    var DEFAULT_IMAGE_MODEL_ID = "gemini-3.1-flash-image";
     var DEFAULT_STATE = {
         stateVersion: LATEST_STATE_VERSION,
+        stateRevision: 0,
         shots: [],
         selectedShotId: null,
         startShotId: null,
@@ -17,7 +21,8 @@
             model: "veo-3.1-generate-preview",
             aspectRatio: "16:9",
             durationSeconds: 8,
-            resolution: "720p"
+            resolution: "720p",
+            seed: null
         },
         videoRefs: [],
         videos: [],
@@ -25,7 +30,7 @@
         images: [],
         selectedImageId: null,
         imageGenSettings: {
-            model: "gemini-3.1-flash-image-preview",
+            model: DEFAULT_IMAGE_MODEL_ID,
             aspectRatio: "1:1",
             imageSize: "1K"
         },
@@ -43,6 +48,7 @@
     var ensurePathsWaiters = [];
     var lastKnownMtimeMs = 0;
     var pollTimer = null;
+    var stateWriterId = "writer_" + String(typeof process !== "undefined" && process && process.pid ? process.pid : "cep") + "_" + String(new Date().getTime()) + "_" + String(Math.floor(Math.random() * 1000000));
 
     function _logError(message) {
         if (global.console && typeof global.console.error === "function") {
@@ -113,10 +119,14 @@
             prompt: input.prompt || null,
             modelId: input.modelId || null,
             aspectRatio: input.aspectRatio || null,
+            imageSize: input.imageSize || null,
             uiMode: input.uiMode || null,
             apiMode: input.apiMode || null,
             durationSeconds: typeof input.durationSeconds === "number" ? input.durationSeconds : null,
             resolution: input.resolution || null,
+            seed: _toNumberOrNull(input.seed),
+            sourceVideoId: input.sourceVideoId || null,
+            sourceVideoPath: input.sourceVideoPath || null,
             videosDir: input.videosDir || null,
             startShotId: input.startShotId || null,
             endShotId: input.endShotId || null,
@@ -131,10 +141,30 @@
             operationName: input.operationName || null,
             operationUrl: input.operationUrl || null,
             requestMode: input.requestMode || null,
+            requestTransport: input.requestTransport || null,
+            referencePlacement: input.referencePlacement || null,
             fallbackReason: input.fallbackReason || null,
             downloadedPath: input.downloadedPath || null,
+            progressPercent: typeof input.progressPercent === "number" ? input.progressPercent : null,
             lastStage: input.lastStage || null,
-            error: input.error || null
+            error: input.error || null,
+            errorCode: input.errorCode || null,
+            errorStatusCode: _toNumberOrNull(input.errorStatusCode),
+            errorDetails: input.errorDetails || null,
+            originalErrorMessage: input.originalErrorMessage || null,
+            attemptCount: _toNumberOrNull(input.attemptCount) || 0,
+            lastErrorAt: input.lastErrorAt || null,
+            cancelRequested: !!input.cancelRequested,
+            claimedBy: input.claimedBy || null,
+            claimExpiresAt: _toNumberOrNull(input.claimExpiresAt),
+            createdByRunner: input.createdByRunner || null,
+            buildId: input.buildId || null,
+            lastProgressAt: input.lastProgressAt || null,
+            resumeRequired: !!input.resumeRequired,
+            recoveryReason: input.recoveryReason || null,
+            retryAfterMs: _toNumberOrNull(input.retryAfterMs),
+            quotaReason: input.quotaReason || null,
+            errorPayload: input.errorPayload || null
         };
     }
 
@@ -154,7 +184,11 @@
         return {
             ownerId: ownerId,
             expiresAt: expiresAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            buildId: input.buildId || null,
+            activeJobId: input.activeJobId || null,
+            lastProgressAt: input.lastProgressAt || null,
+            runId: input.runId || null
         };
     }
 
@@ -165,7 +199,7 @@
         if (mode === "image" || mode === "interpolation") {
             mode = "frames";
         }
-        if (mode !== "text" && mode !== "frames" && mode !== "reference") {
+        if (mode !== "text" && mode !== "frames" && mode !== "reference" && mode !== "extend") {
             mode = "frames";
         }
 
@@ -184,8 +218,17 @@
             mode: mode,
             durationSeconds: typeof input.durationSeconds === "number" ? input.durationSeconds : null,
             resolution: input.resolution || null,
+            seed: _toNumberOrNull(input.seed),
+            sourceVideoId: input.sourceVideoId || null,
+            sourceVideoPath: input.sourceVideoPath || null,
             refIds: input.refIds && input.refIds instanceof Array ? input.refIds : [],
+            operationName: input.operationName || null,
+            operationUrl: input.operationUrl || null,
+            attemptCount: _toNumberOrNull(input.attemptCount) || 0,
             requestMode: input.requestMode || null,
+            requestTransport: input.requestTransport || null,
+            referencePlacement: input.referencePlacement || null,
+            fallbackReason: input.fallbackReason || null,
             status: input.status || "ready",
             importedToProject: !!input.importedToProject,
             projectImportPath: input.projectImportPath || null,
@@ -205,7 +248,7 @@
             sampleCount: _toNumberOrNull(input.sampleCount),
             aspectRatio: input.aspectRatio || "1:1",
             imageSize: input.imageSize || "1K",
-            model: input.model || "gemini-3.1-flash-image-preview",
+            model: input.model || DEFAULT_IMAGE_MODEL_ID,
             refIds: input.refIds && input.refIds instanceof Array ? input.refIds.slice(0) : [],
             refPaths: input.refPaths && input.refPaths instanceof Array ? input.refPaths.slice(0) : [],
             width: typeof input.width === "number" ? input.width : null,
@@ -231,7 +274,7 @@
     function _normalizeImageGenSettings(settings) {
         var input = settings || {};
         return {
-            model: input.model || "gemini-3.1-flash-image-preview",
+            model: input.model === "gemini-3.1-flash-image-preview" || input.model === "gemini-2.5-flash-image" ? DEFAULT_IMAGE_MODEL_ID : (input.model || DEFAULT_IMAGE_MODEL_ID),
             aspectRatio: input.aspectRatio || "1:1",
             imageSize: input.imageSize || "1K"
         };
@@ -265,7 +308,8 @@
             model: input.model || "veo-3.1-generate-preview",
             aspectRatio: aspectRatio,
             durationSeconds: durationSeconds,
-            resolution: resolution
+            resolution: resolution,
+            seed: _toNumberOrNull(input.seed)
         };
     }
 
@@ -393,6 +437,86 @@
         return next;
     }
 
+    function _migrateStateToV4(candidate) {
+        var next = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
+        if (next.imageGenSettings && next.imageGenSettings.model === "gemini-3.1-flash-image-preview") {
+            next.imageGenSettings.model = DEFAULT_IMAGE_MODEL_ID;
+        }
+        next.stateVersion = 4;
+        return next;
+    }
+
+    function _migrateStateToV5(candidate) {
+        var next = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
+        if (next.imageGenSettings && next.imageGenSettings.model === "gemini-2.5-flash-image") {
+            next.imageGenSettings.model = DEFAULT_IMAGE_MODEL_ID;
+        }
+        next.stateVersion = 5;
+        return next;
+    }
+
+    function _migrateStateToV6(candidate) {
+        var next = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
+        if (next.videoGenSettings && typeof next.videoGenSettings.seed === "undefined") {
+            next.videoGenSettings.seed = null;
+        }
+        next.stateVersion = 6;
+        return next;
+    }
+
+    function _migrateStateToV7(candidate) {
+        var next = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
+        var i;
+        if (next.pendingJobs && next.pendingJobs instanceof Array) {
+            for (i = 0; i < next.pendingJobs.length; i += 1) {
+                if (!next.pendingJobs[i]) { continue; }
+                if (typeof next.pendingJobs[i].attemptCount === "undefined") { next.pendingJobs[i].attemptCount = 0; }
+                if (typeof next.pendingJobs[i].cancelRequested === "undefined") { next.pendingJobs[i].cancelRequested = false; }
+            }
+        }
+        next.stateVersion = 7;
+        return next;
+    }
+
+    function _migrateStateToV8(candidate) {
+        var next = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
+        var jobs = next.pendingJobs && next.pendingJobs instanceof Array ? next.pendingJobs : [];
+        var i;
+        var item;
+        var status;
+        var hasOperation;
+
+        for (i = 0; i < jobs.length; i += 1) {
+            item = jobs[i];
+            if (!item || item.kind !== "video") {
+                continue;
+            }
+            status = String(item.status || "queued").toLowerCase();
+            hasOperation = !!(item.operationName || item.operationUrl);
+            if (status === "queued" && !hasOperation) {
+                item.status = "waiting_resume";
+                item.resumeRequired = true;
+                item.recoveryReason = "Migrated unsent job; explicit Resume is required.";
+            } else if ((status === "uploading" || status === "polling") && !hasOperation) {
+                item.status = "needs_review";
+                item.resumeRequired = true;
+                item.recoveryReason = "Submission was interrupted before an operation name was saved.";
+            } else if (status === "importing" && hasOperation) {
+                item.status = "downloading";
+                item.resumeRequired = false;
+            } else if ((status === "polling" || status === "downloading") && hasOperation) {
+                item.resumeRequired = false;
+            }
+            item.claimedBy = null;
+            item.claimExpiresAt = null;
+            item.lastProgressAt = item.lastProgressAt || item.updatedAt || null;
+        }
+        next.pendingJobsLease = null;
+        next.stateRevision = _toNumberOrNull(next.stateRevision) || 0;
+        next.stateVersion = 8;
+        return next;
+    }
+
     function _migrateState(candidate) {
         var migrated = candidate && typeof candidate === "object" ? _cloneJson(candidate) : {};
         var version = _toStateVersion(migrated && migrated.stateVersion);
@@ -409,6 +533,26 @@
             migrated = _migrateStateToV3(migrated);
             version = 3;
         }
+        if (version < 4) {
+            migrated = _migrateStateToV4(migrated);
+            version = 4;
+        }
+        if (version < 5) {
+            migrated = _migrateStateToV5(migrated);
+            version = 5;
+        }
+        if (version < 6) {
+            migrated = _migrateStateToV6(migrated);
+            version = 6;
+        }
+        if (version < 7) {
+            migrated = _migrateStateToV7(migrated);
+            version = 7;
+        }
+        if (version < 8) {
+            migrated = _migrateStateToV8(migrated);
+            version = 8;
+        }
 
         if (!migrated || typeof migrated !== "object") {
             migrated = {};
@@ -424,6 +568,8 @@
         var videos = [];
         var images = [];
         var refs = [];
+        var videoRefs = [];
+        var normalizedRef;
         var i;
 
         if (input.shots && input.shots instanceof Array) {
@@ -452,12 +598,25 @@
 
         if (input.refs && input.refs instanceof Array) {
             for (i = 0; i < input.refs.length; i += 1) {
-                refs.push(_normalizeRef(input.refs[i]));
+                normalizedRef = _normalizeRef(input.refs[i]);
+                if (normalizedRef && normalizedRef.path) {
+                    refs.push(normalizedRef);
+                }
+            }
+        }
+
+        if (input.videoRefs && input.videoRefs instanceof Array) {
+            for (i = 0; i < input.videoRefs.length; i += 1) {
+                normalizedRef = _normalizeRef(input.videoRefs[i]);
+                if (normalizedRef && normalizedRef.path) {
+                    videoRefs.push(normalizedRef);
+                }
             }
         }
 
         return {
             stateVersion: LATEST_STATE_VERSION,
+            stateRevision: _toNumberOrNull(input.stateRevision) || 0,
             shots: shots,
             selectedShotId: input.selectedShotId || null,
             startShotId: input.startShotId || null,
@@ -465,7 +624,7 @@
             pendingJobs: pendingJobs,
             pendingJobsLease: _normalizePendingJobsLease(input.pendingJobsLease),
             videoGenSettings: _normalizeVideoGenSettings(input.videoGenSettings),
-            videoRefs: input.videoRefs && input.videoRefs instanceof Array ? input.videoRefs.map(_normalizeRef) : [],
+            videoRefs: videoRefs,
             videos: videos,
             selectedVideoId: input.selectedVideoId || null,
             images: images,
@@ -518,8 +677,55 @@
         return {
             userDataDir: userDataDir,
             veoBridgeDir: veoBridgeDir,
-            stateFile: stateFile
+            stateFile: stateFile,
+            previousStateFile: stateFile + ".previous",
+            writeLockFile: stateFile + ".lock"
         };
+    }
+
+    function _busyWait(ms) {
+        var until = new Date().getTime() + Math.max(0, ms || 0);
+        while (new Date().getTime() < until) {
+            // The write lock is held only for a few milliseconds.
+        }
+    }
+
+    function _acquireStateWriteLock(storagePaths) {
+        var attempt;
+        var fd;
+        var stats;
+        var age;
+        if (!fs || !storagePaths || typeof fs.openSync !== "function") {
+            return { fallback: true };
+        }
+        for (attempt = 0; attempt < STATE_WRITE_LOCK_ATTEMPTS; attempt += 1) {
+            try {
+                fd = fs.openSync(storagePaths.writeLockFile, "wx");
+                try {
+                    fs.writeFileSync(fd, JSON.stringify({ ownerId: stateWriterId, createdAt: (new Date()).toISOString() }), "utf8");
+                } catch (writeLockError) { /* ownership is represented by the file itself */ }
+                return { fd: fd, path: storagePaths.writeLockFile };
+            } catch (lockError) {
+                try {
+                    stats = fs.statSync(storagePaths.writeLockFile);
+                    age = new Date().getTime() - (stats && typeof stats.mtimeMs === "number" ? stats.mtimeMs : 0);
+                    if (age > STATE_WRITE_LOCK_STALE_MS) {
+                        fs.unlinkSync(storagePaths.writeLockFile);
+                        continue;
+                    }
+                } catch (staleCheckError) { /* another writer may have just released it */ }
+                _busyWait(4 + attempt);
+            }
+        }
+        return null;
+    }
+
+    function _releaseStateWriteLock(lock) {
+        if (!fs || !lock || lock.fallback) {
+            return;
+        }
+        try { if (typeof lock.fd === "number") { fs.closeSync(lock.fd); } } catch (closeError) { /* ignore */ }
+        try { if (lock.path && fs.existsSync(lock.path)) { fs.unlinkSync(lock.path); } } catch (unlinkError) { /* stale-lock recovery handles it */ }
     }
 
     function _ensureStorageDir(storagePaths) {
@@ -569,8 +775,10 @@
         }
     }
 
-    function _writeStateToDisk(nextState) {
-        var storagePaths = _getStoragePaths();
+    function _writeStateToDiskUnlocked(nextState, storagePaths) {
+        var temporaryFile;
+        var previousFile;
+        var existingIsValid = false;
 
         if (!fs || !storagePaths) {
             return false;
@@ -581,13 +789,62 @@
         }
 
         try {
-            fs.writeFileSync(storagePaths.stateFile, JSON.stringify(nextState, null, 2), "utf8");
+            temporaryFile = storagePaths.stateFile + ".tmp-" + stateWriterId + "-" + String(new Date().getTime()) + "-" + String(Math.floor(Math.random() * 1000000));
+            previousFile = storagePaths.previousStateFile;
+            fs.writeFileSync(temporaryFile, JSON.stringify(nextState), "utf8");
+            if (fs.existsSync(storagePaths.stateFile)) {
+                try {
+                    JSON.parse(fs.readFileSync(storagePaths.stateFile, "utf8"));
+                    existingIsValid = true;
+                } catch (existingParseError) {
+                    existingIsValid = false;
+                }
+            }
+            if (existingIsValid && previousFile) {
+                fs.copyFileSync(storagePaths.stateFile, previousFile);
+            }
+            try {
+                fs.renameSync(temporaryFile, storagePaths.stateFile);
+            } catch (renameError) {
+                if (fs.existsSync(storagePaths.stateFile)) {
+                    fs.unlinkSync(storagePaths.stateFile);
+                }
+                try {
+                    fs.renameSync(temporaryFile, storagePaths.stateFile);
+                } catch (replaceError) {
+                    if (previousFile && fs.existsSync(previousFile) && !fs.existsSync(storagePaths.stateFile)) {
+                        fs.copyFileSync(previousFile, storagePaths.stateFile);
+                    }
+                    throw replaceError;
+                }
+            }
             lastKnownMtimeMs = _readMtimeMs(storagePaths.stateFile);
             return true;
         } catch (error) {
+            try { if (temporaryFile && fs.existsSync(temporaryFile)) { fs.unlinkSync(temporaryFile); } } catch (cleanupError) { /* ignore */ }
             _logError("Failed to write state file: " + String(error));
             return false;
         }
+    }
+
+    function _writeStateToDisk(nextState) {
+        var storagePaths = _getStoragePaths();
+        var lock;
+        var result;
+        if (!storagePaths || !_ensureStorageDir(storagePaths)) {
+            return false;
+        }
+        lock = _acquireStateWriteLock(storagePaths);
+        if (!lock) {
+            _logError("Timed out waiting for state write lock.");
+            return false;
+        }
+        try {
+            result = _writeStateToDiskUnlocked(nextState, storagePaths);
+        } finally {
+            _releaseStateWriteLock(lock);
+        }
+        return result;
     }
 
     function _readStateFromDisk() {
@@ -604,8 +861,11 @@
             return _cloneJson(DEFAULT_STATE);
         }
 
+        if (!fs.existsSync(storagePaths.stateFile) && storagePaths.previousStateFile && fs.existsSync(storagePaths.previousStateFile)) {
+            try { fs.copyFileSync(storagePaths.previousStateFile, storagePaths.stateFile); } catch (restoreError) { /* read fallback below */ }
+        }
+
         if (!fs.existsSync(storagePaths.stateFile)) {
-            _writeStateToDisk(DEFAULT_STATE);
             return _cloneJson(DEFAULT_STATE);
         }
 
@@ -616,8 +876,19 @@
             lastKnownMtimeMs = _readMtimeMs(storagePaths.stateFile);
             return normalized;
         } catch (error) {
-            _logError("Failed to read state file, resetting defaults: " + String(error));
-            _writeStateToDisk(DEFAULT_STATE);
+            try {
+                fs.copyFileSync(storagePaths.stateFile, storagePaths.stateFile + ".corrupt-" + String(new Date().getTime()) + ".bak");
+            } catch (backupError) { /* keep recovery best-effort */ }
+            if (storagePaths.previousStateFile && fs.existsSync(storagePaths.previousStateFile)) {
+                try {
+                    raw = fs.readFileSync(storagePaths.previousStateFile, "utf8");
+                    parsed = raw ? JSON.parse(raw) : {};
+                    normalized = _normalizeState(parsed);
+                    _logError("Failed to read state file; recovered the last valid revision: " + String(error));
+                    return normalized;
+                } catch (previousReadError) { /* defaults remain the final fallback */ }
+            }
+            _logError("Failed to read state file; a backup was kept and defaults restored: " + String(error));
             return _cloneJson(DEFAULT_STATE);
         }
     }
@@ -695,9 +966,23 @@
         },
 
         saveState: function (newState) {
-            var normalized = _normalizeState(newState);
-            if (!_writeStateToDisk(normalized)) {
+            var storagePaths = _getStoragePaths();
+            var lock = storagePaths ? _acquireStateWriteLock(storagePaths) : null;
+            var base;
+            var normalized;
+            if (!lock) {
+                _logError("Timed out waiting for state write lock.");
                 return _cloneJson(cachedState || DEFAULT_STATE);
+            }
+            try {
+                base = _readStateFromDisk();
+                normalized = _normalizeState(newState);
+                normalized.stateRevision = Math.max(_toNumberOrNull(base && base.stateRevision) || 0, _toNumberOrNull(normalized.stateRevision) || 0) + 1;
+                if (!_writeStateToDiskUnlocked(normalized, storagePaths)) {
+                    return _cloneJson(cachedState || DEFAULT_STATE);
+                }
+            } finally {
+                _releaseStateWriteLock(lock);
             }
             cachedState = normalized;
             _emitStateChanged();
@@ -705,9 +990,25 @@
         },
 
         updateState: function (patch) {
-            var base = _readStateFromDisk();
+            return api.updateStateWith(function () {
+                return patch || {};
+            });
+        },
+
+        updateStateWith: function (mutator) {
+            var storagePaths = _getStoragePaths();
+            var lock = storagePaths ? _acquireStateWriteLock(storagePaths) : null;
+            var base;
+            var patch;
+            var normalized;
+            if (!lock) {
+                _logError("Timed out waiting for state write lock.");
+                return _cloneJson(cachedState || DEFAULT_STATE);
+            }
+            base = _readStateFromDisk();
             var next = {
                 stateVersion: base.stateVersion || LATEST_STATE_VERSION,
+                stateRevision: base.stateRevision || 0,
                 shots: base.shots,
                 selectedShotId: base.selectedShotId,
                 startShotId: base.startShotId,
@@ -727,15 +1028,36 @@
 
             cachedState = _cloneJson(base);
 
-            if (patch && typeof patch === "object") {
-                for (key in patch) {
-                    if (patch.hasOwnProperty(key)) {
-                        next[key] = patch[key];
-                    }
+            try {
+                patch = typeof mutator === "function" ? mutator(_cloneJson(base)) : {};
+            } catch (mutatorError) {
+                _releaseStateWriteLock(lock);
+                throw mutatorError;
+            }
+
+            if (!patch || typeof patch !== "object" || Object.keys(patch).length === 0) {
+                _releaseStateWriteLock(lock);
+                return _cloneJson(cachedState);
+            }
+
+            for (key in patch) {
+                if (patch.hasOwnProperty(key)) {
+                    next[key] = patch[key];
                 }
             }
 
-            return api.saveState(next);
+            normalized = _normalizeState(next);
+            normalized.stateRevision = (_toNumberOrNull(base.stateRevision) || 0) + 1;
+            try {
+                if (!_writeStateToDiskUnlocked(normalized, storagePaths)) {
+                    return _cloneJson(cachedState || DEFAULT_STATE);
+                }
+            } finally {
+                _releaseStateWriteLock(lock);
+            }
+            cachedState = normalized;
+            _emitStateChanged();
+            return _cloneJson(cachedState);
         },
 
         getState: function () {
@@ -787,7 +1109,9 @@
             });
 
             return null;
-        }
+        },
+        _testNormalizeState: _normalizeState,
+        _testGetStoragePaths: _getStoragePaths
     };
 
     fs = _safeRequire("fs");
